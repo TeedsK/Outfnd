@@ -1,0 +1,29 @@
+{
+  "name": "outfnd",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev:ext": "npm run dev -w apps/extension",
+    "dev:web": "npm run dev -w apps/web-viewer",
+    "build:ext": "npm run build -w apps/extension",
+    "build:web": "npm run build -w apps/web-viewer",
+    "typecheck": "tsc -b",
+    "format": "prettier -w ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "private": "true",
+  "workspaces": [
+    "apps/extension",
+    "apps/web-viewer",
+    "packages/shared",
+    "functions"
+  ],
+  "devDependencies": {
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.2"
+  }
+}

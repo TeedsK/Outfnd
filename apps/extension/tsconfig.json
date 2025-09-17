@@ -1,0 +1,28 @@
+{
+  "//": "Outfnd — Extension TSConfig. Uses chrome-types + Vite types and robust typeRoots.",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": [
+      "chrome-types",
+      "vite/client"
+    ],
+    "typeRoots": [
+      "./node_modules",
+      "../../node_modules/@types",
+      "../../node_modules"
+    ],
+    "resolveJsonModule": true,
+    "noEmit": false,
+    "baseUrl": ".",
+    "paths": {
+      "@outfnd/shared/*": [
+        "../../packages/shared/src/*"
+      ]
+    }
+  },
+  "include": [
+    "src",
+    "manifest.json",
+    "sidepanel.html"
+  ]
+}

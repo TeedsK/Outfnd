@@ -1,0 +1,25 @@
+{
+    "//": "Outfnd — Base TSConfig (shared across workspaces). Targets modern browsers & Node.",
+    "compilerOptions": {
+        "target": "ES2022",
+        "lib": [
+            "ES2022",
+            "DOM"
+        ],
+        "module": "ESNext",
+        "moduleResolution": "Bundler",
+        "jsx": "react-jsx",
+        "strict": true,
+        "esModuleInterop": true,
+        "allowSyntheticDefaultImports": true,
+        "noFallthroughCasesInSwitch": true,
+        "forceConsistentCasingInFileNames": true,
+        "skipLibCheck": true,
+        "baseUrl": ".",
+        "paths": {
+            "@outfnd/shared/*": [
+                "packages/shared/src/*"
+            ]
+        }
+    }
+}

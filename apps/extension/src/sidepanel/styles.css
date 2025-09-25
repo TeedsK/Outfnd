@@ -281,6 +281,80 @@ a:hover {
     animation: outfnd-spin 0.9s linear infinite;
 }
 
+.spinner.tiny {
+    width: 16px;
+    height: 16px;
+    border-width: 2px;
+    border-top-color: #9aa3b2;
+}
+
 @keyframes outfnd-spin {
-    to { transform: rotate(360deg); }
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* --- ImagePicker --- */
+.ip-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+    gap: 8px;
+}
+
+.ip-thumb {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    background: var(--bg-soft);
+    padding: 0;
+}
+
+.ip-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+.ip-thumb.sel {
+    outline: 2px solid #0ea5e9;
+}
+
+.ip-check {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    background: #0ea5e9;
+    color: #fff;
+    font-size: 12px;
+    line-height: 1;
+    padding: 4px 6px;
+    border-radius: 999px;
+}
+
+/* ImagePicker skeletons during loading */
+.ip-skel {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(90deg, #f3f4f6, #e5e7eb, #f3f4f6);
+    background-size: 200% 100%;
+    animation: ip-skel-shimmer 1.2s ease-in-out infinite;
+}
+
+@keyframes ip-skel-shimmer {
+    0% {
+        background-position: 0% 0;
+    }
+
+    50% {
+        background-position: 100% 0;
+    }
+
+    100% {
+        background-position: 0% 0;
+    }
 }

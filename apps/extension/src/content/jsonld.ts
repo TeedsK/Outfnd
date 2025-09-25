@@ -1,8 +1,11 @@
 /**
  * Outfnd — JSON-LD extractor
  * Purpose: Parse <script type="application/ld+json"> blocks and locate a Product.
+ * Update: expose image candidates for LLM selection; keep extractor for fallback only.
  */
 import type { ExtractedProduct } from "@outfnd/shared/clip";
+import type { ImageCandidate } from "./imageFilter";
+import { finalizeImageCandidates } from "./imageFilter";
 
 type JsonObject = Record<string, unknown>;
 
@@ -58,7 +61,6 @@ function findProduct(node: unknown): JsonObject | null {
 function parsePrice(numLike: unknown): number | null {
     if (typeof numLike === "number") return numLike;
     if (typeof numLike === "string") {
-        // Normalize values like "€59,99" → "59.99"
         const normalized = numLike.replace(/[^\d,.-]/g, "").replace(/,(\d{2})$/, ".$1");
         const n = Number(normalized);
         return Number.isFinite(n) ? n : null;
@@ -66,6 +68,45 @@ function parsePrice(numLike: unknown): number | null {
     return null;
 }
 
+/** Recursively collect any image-like URLs from a JSON object. */
+function collectImagesDeep(node: unknown): string[] {
+    const out: string[] = [];
+    const visit = (v: unknown) => {
+        if (typeof v === "string") {
+            if (/^data:image\//i.test(v) || /\.(jpe?g|png|webp|avif)(\?|#|$)/i.test(v)) out.push(v);
+            return;
+        }
+        if (Array.isArray(v)) {
+            for (const x of v) visit(x);
+            return;
+        }
+        if (isObject(v)) {
+            for (const [, val] of Object.entries(v)) visit(val);
+        }
+    };
+    visit(node);
+    return out;
+}
+
+/** Exported: collect JSON-LD image candidates for selection. */
+export function collectJsonLdImageCandidates(doc: Document): ImageCandidate[] {
+    const scripts = Array.from(doc.querySelectorAll('script[type="application/ld+json"]'));
+    for (const s of scripts) {
+        const raw = s.textContent || "";
+        const parsed = safeParse(raw);
+        if (!parsed) continue;
+        const product = findProduct(parsed);
+        if (!product) continue;
+
+        const primary = toArray<string>(product.image as string | string[] | undefined).filter(Boolean);
+        const deep = collectImagesDeep(product);
+        const urls = [...primary, ...deep];
+        return urls.map((url) => ({ url, origin: "jsonld" }));
+    }
+    return [];
+}
+
+/** Legacy extractor (fallback only when no selection is applied). */
 export function extractFromJsonLd(doc: Document): ExtractedProduct | null {
     const scripts = Array.from(doc.querySelectorAll('script[type="application/ld+json"]'));
     for (const s of scripts) {
@@ -80,9 +121,10 @@ export function extractFromJsonLd(doc: Document): ExtractedProduct | null {
         const desc = (product.description as string | undefined) ??
             ((product as JsonObject)["descriptionShort"] as string | undefined);
 
-        const imageArr = toArray<string>(product.image as string | string[] | undefined).filter(
-            Boolean
-        );
+        const primary = toArray<string>(product.image as string | string[] | undefined).filter(Boolean);
+        const deep = collectImagesDeep(product);
+
+        const imageArr = finalizeImageCandidates([...primary, ...deep].map((u) => ({ url: u, origin: "jsonld" })), 24);
 
         const offers = toArray<JsonObject>(product.offers as JsonObject | JsonObject[] | undefined);
 

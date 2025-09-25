@@ -1,52 +1,46 @@
 /**
  * Firebase Function: aiLogic (single endpoint router)
  * Ops:
- *  - summarize        -> { bullets: string[] }
- *  - detectLanguage   -> { language: string }
- *  - translate        -> { translated: string }
- *  - classify         -> schema-constrained JSON { category, colors, ... }
- *  - composeLooks     -> { looks: [...] }
- *  - describeGarment  -> { bullets: string[], ...aux render hints... }
- *  - renderLook       -> { dataUrl: "data:image/png;base64,..." }
- *
- * Image previews are now generated with Gemini 2.5 Flash Image **Preview** (aka “Nano Banana”),
- * using the mannequin as the base layer and blending the wardrobe item images on top.
- * If hints are not provided, we auto-describe garments to extract fit/placement/drift cues.
+ *  - summarize        -> { bullets }
+ *  - detectLanguage   -> { language }
+ *  - translate        -> { translated }
+ *  - classify         -> schema-constrained JSON
+ *  - composeLooks     -> { looks }
+ *  - describeGarment  -> garment hints JSON
+ *  - selectProductImages -> { groups: {confident, semiConfident, notConfident}, debug }
+ *  - renderLook       -> { dataUrl }
  */
-
 import * as logger from "firebase-functions/logger";
 import { onRequest } from "firebase-functions/v2/https";
 import { initializeApp } from "firebase-admin/app";
+import {
+    SUMMARIZE_INSTR,
+    DETECT_LANGUAGE_INSTR,
+    TRANSLATE_INSTR,
+    CLASSIFY_INSTR,
+    COMPOSE_LOOKS_INSTR,
+    DESCRIBE_GARMENT_PREFACE,
+    SELECT_PRODUCT_IMAGES_HEADER,
+    RENDER_STYLE_LINE,
+    RENDER_BG_LINE
+} from "./prompts";
+import { featuresFromBuffer, minDistanceToAnchors, colorDistance } from "./vision";
 
 initializeApp();
 
 type Json = Record<string, unknown>;
 
-/** ---------- Config ---------- */
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const REGION = "us-central1";
 const TEXT_MODEL = process.env.TEXT_MODEL || "gemini-1.5-flash";
-
-/**
- * IMPORTANT: default to the preview image model, which supports editing/multi-image fusion.
- * See: https://developers.googleblog.com/en/introducing-gemini-2-5-flash-image/ ,
- *      https://ai.google.dev/gemini-api/docs/image-generation
- */
 const IMAGE_MODEL = process.env.IMAGE_MODEL || "gemini-2.5-flash-image-preview";
 
-/** ---------- Utilities ---------- */
+/* ---------------- Utilities ---------------- */
 
-function ok(res: any, data: unknown): void {
-    res.status(200).json(data);
-}
-function bad(res: any, code: number, msg: string): void {
-    res.status(code).json({ error: msg });
-}
-function ensureKey(): void {
-    if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not set");
-}
+function ok(res: any, data: unknown): void { res.status(200).json(data); }
+function bad(res: any, code: number, msg: string): void { res.status(code).json({ error: msg }); }
+function ensureKey(): void { if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not set"); }
 
-/** extract the first plain text part from a generateContent response */
 function extractText(anyResp: unknown): string {
     const r = anyResp as any;
     const c = r?.candidates?.[0];
@@ -54,16 +48,10 @@ function extractText(anyResp: unknown): string {
     const t = parts.find((p: any) => typeof p?.text === "string")?.text;
     return typeof t === "string" ? t : "";
 }
-
-/** parse JSON placed in the first text part from a generateContent response */
 function extractJson(anyResp: unknown): Json {
     const txt = extractText(anyResp);
-    try {
-        const obj = JSON.parse(txt);
-        if (obj && typeof obj === "object") return obj as Json;
-    } catch {
-        /* noop: fallthrough */
-    }
+    try { const obj = JSON.parse(txt); if (obj && typeof obj === "object") return obj as Json; }
+    catch { /* ignore */ }
     return {};
 }
 
@@ -73,18 +61,13 @@ async function postJson(url: string, body: unknown): Promise<any> {
         headers: { "x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json" },
         body: JSON.stringify(body)
     });
-    if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Gemini API ${res.status}: ${text}`);
-    }
+    if (!res.ok) { const text = await res.text(); throw new Error(`Gemini API ${res.status}: ${text}`); }
     return await res.json();
 }
 
 async function generateContent(model: string, request: Json): Promise<any> {
     ensureKey();
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-        model
-    )}:generateContent`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
     return await postJson(url, request);
 }
 
@@ -96,9 +79,7 @@ async function fetchAsInline(url: string): Promise<{ mime: string; base64: strin
         const buf = new Uint8Array(await res.arrayBuffer());
         const b64 = Buffer.from(buf).toString("base64");
         return { mime: ct, base64: b64 };
-    } catch {
-        return undefined;
-    }
+    } catch { return undefined; }
 }
 
 function parseDataUrl(dataUrl: string): { mime: string; base64: string } | undefined {
@@ -107,77 +88,35 @@ function parseDataUrl(dataUrl: string): { mime: string; base64: string } | undef
     return { mime: m[1], base64: m[2] };
 }
 
-/** ---------- Image generation helpers (Nano Banana) ---------- */
-
-/**
- * Try image editing / fusion using:
- *  1) generateContent on IMAGE_MODEL with responseMimeType=image/png and inline_data parts
- *  2) fallback to v1beta images:generate
- */
-async function generateOutfitImageNanoBanana(
+async function generateImageFromParts(
     prompt: string,
     images: Array<{ mime: string; base64: string }>
 ): Promise<string> {
     ensureKey();
-
-    // Attempt 1: generateContent with inline_data
-    try {
-        const parts: any[] = [{ text: prompt }, ...images.map((i) => ({ inline_data: { mime_type: i.mime, data: i.base64 } }))];
-        const req = {
-            contents: [{ role: "user", parts }],
-            generationConfig: {
-                responseMimeType: "image/png"
-            }
-        };
-        const resp = await generateContent(IMAGE_MODEL, req as Json);
-        const candidate = resp?.candidates?.[0];
-        const outParts = candidate?.content?.parts ?? [];
-        const img = outParts.find((p: any) => p?.inline_data?.data)?.inline_data;
-        if (img?.data) return `data:${img.mime_type || "image/png"};base64,${img.data}`;
-    } catch (e) {
-        logger.warn("generateContent(image) failed; will try fallback", e as Error);
-    }
-
-    // Attempt 2: images:generate (preview supports text+image fusion)
-    try {
-        const url = "https://generativelanguage.googleapis.com/v1beta/images:generate";
-        const req = {
-            model: IMAGE_MODEL,
-            prompt: { text: prompt },
-            images: images.map((i) => ({ inlineData: { mimeType: i.mime, data: i.base64 } }))
-        };
-        const resp = await postJson(url, req);
-        const first = resp?.images?.[0];
-        if (first?.inlineData?.data) {
-            return `data:${first.inlineData.mimeType || "image/png"};base64,${first.inlineData.data}`;
-        }
-    } catch (e) {
-        logger.warn("images:generate failed", e as Error);
-    }
-
-    throw new Error("Image generation unavailable (model or endpoint not enabled)");
+    const parts: any[] = [{ text: prompt }, ...images.map((i) => ({ inline_data: { mime_type: i.mime, data: i.base64 } }))];
+    const req = { contents: [{ role: "user", parts }] };
+    const resp = await generateContent(IMAGE_MODEL, req as Json);
+    const candidate = resp?.candidates?.[0];
+    const outParts = candidate?.content?.parts ?? [];
+    const img = outParts.find((p: any) => p?.inline_data?.data)?.inline_data;
+    if (img?.data) return `data:${img.mime_type || "image/png"};base64,${img.data}`;
+    throw new Error("Image generation unavailable (no inline image in response)");
 }
 
-/** ---------- Text ops ---------- */
+/* ---------------- Ops (text) ---------------- */
 
 async function opSummarize(payload: { text: string }) {
-    const instr = "Summarize the following product information into 3–5 concise bullet points (fit, care, returns).";
     const resp = await generateContent(TEXT_MODEL, {
-        contents: [{ role: "user", parts: [{ text: `${instr}\n\n${payload.text}` }] }]
+        contents: [{ role: "user", parts: [{ text: `${SUMMARIZE_INSTR}\n\n${payload.text}` }] }]
     });
     const text = extractText(resp);
-    const bullets = text
-        .split("\n")
-        .map((l) => l.trim().replace(/^[-*•]\s*/, ""))
-        .filter(Boolean)
-        .slice(0, 5);
+    const bullets = text.split("\n").map((l) => l.trim().replace(/^[-*•]\s*/, "")).filter(Boolean).slice(0, 5);
     return { bullets };
 }
 
 async function opDetectLanguage(payload: { text: string }) {
-    const instr = "Detect the language and return ONLY a BCP‑47 code (e.g., en, es, fr).";
     const resp = await generateContent(TEXT_MODEL, {
-        contents: [{ role: "user", parts: [{ text: `${instr}\n\n${payload.text}` }] }],
+        contents: [{ role: "user", parts: [{ text: `${DETECT_LANGUAGE_INSTR}\n\n${payload.text}` }] }],
         generationConfig: { responseMimeType: "text/plain" }
     });
     const code = extractText(resp).trim().split(/\s+/)[0] || "und";
@@ -185,35 +124,25 @@ async function opDetectLanguage(payload: { text: string }) {
 }
 
 async function opTranslate(payload: { text: string; from?: string; to: string }) {
-    const instr = `Translate from ${payload.from || "auto"} to ${payload.to}. Return only the translation.`;
     const resp = await generateContent(TEXT_MODEL, {
-        contents: [{ role: "user", parts: [{ text: `${instr}\n\n${payload.text}` }] }],
+        contents: [{ role: "user", parts: [{ text: `${TRANSLATE_INSTR(payload.from, payload.to)}\n\n${payload.text}` }] }],
         generationConfig: { responseMimeType: "text/plain" }
     });
     return { translated: extractText(resp) };
 }
 
-/** ---------- JSON‑mode ops ---------- */
+/* ---------------- Ops (JSON mode) ---------------- */
 
 async function opClassify(payload: { text: string; imageDataUrl?: string; schema: Json }) {
-    const instruction = [
-        "You are a fashion product attribute classifier.",
-        "Return ONLY JSON that conforms to the provided schema.",
-        "Use common fashion terms (e.g., 'navy', 'ecru', 'pinstripe').",
-        "Infer reasonable attributes if not explicitly stated."
-    ].join(" ");
-
-    const parts: any[] = [{ text: `${instruction}\n\nProduct details:\n${payload.text}` }];
+    const parts: any[] = [{ text: `${CLASSIFY_INSTR}\n\nProduct details:\n${payload.text}` }];
     if (payload.imageDataUrl?.startsWith("data:")) {
         const parsed = parseDataUrl(payload.imageDataUrl);
         if (parsed) parts.push({ inline_data: { mime_type: parsed.mime, data: parsed.base64 } });
     }
-
     const resp = await generateContent(TEXT_MODEL, {
         contents: [{ role: "user", parts }],
         generationConfig: { responseMimeType: "application/json", responseSchema: payload.schema }
     });
-
     return extractJson(resp);
 }
 
@@ -222,23 +151,16 @@ async function opComposeLooks(payload: {
     createdFromItemId?: string;
     schema: Json;
 }) {
-    const instruction = [
-        "Compose three outfits for the following occasions: casual, office, evening.",
-        "Use ONLY the provided wardrobe item ids.",
-        payload.createdFromItemId ? `Include the seed item id "${payload.createdFromItemId}" in each look.` : "",
-        "Return ONLY JSON that conforms to the schema. Avoid commentary outside JSON."
-    ].join(" ");
-
+    const instr = COMPOSE_LOOKS_INSTR(payload.createdFromItemId);
     const resp = await generateContent(TEXT_MODEL, {
-        contents: [{ role: "user", parts: [{ text: `${instruction}\n\nWardrobe:\n${JSON.stringify(payload.wardrobe, null, 2)}` }] }],
+        contents: [{ role: "user", parts: [{ text: `${instr}\n\nWardrobe:\n${JSON.stringify(payload.wardrobe, null, 2)}` }] }],
         generationConfig: { responseMimeType: "application/json", responseSchema: payload.schema }
     });
-
     const obj = extractJson(resp);
     return { looks: Array.isArray(obj["looks"]) ? (obj["looks"] as unknown[]) : [] };
 }
 
-/** ---------- Garment description (image+text → placement hints) ---------- */
+/* ---------------- describeGarment ---------------- */
 
 const DEFAULT_GARMENT_SCHEMA: Json = {
     type: "object",
@@ -270,16 +192,8 @@ async function opDescribeGarment(payload: {
 }) {
     const schema = payload.schema ?? DEFAULT_GARMENT_SCHEMA;
 
-    const preface = [
-        "You are a fashion vision-language expert. Analyze the garment in the provided image(s) and optional text.",
-        "Return ONLY JSON per the schema. Be specific and concise.",
-        "Include body-position cues (e.g., 'hem hits at knees', 'cropped above ankle'), fit (slim/relaxed/oversized), silhouette, rise/waist.",
-        "Provide stylingNotes that help place and align this garment on a blank mannequin realistically."
-    ].join(" ");
+    const parts: any[] = [{ text: `${DESCRIBE_GARMENT_PREFACE}\n\nTitle: ${payload.title ?? ""}\n\nDetails:\n${payload.text ?? ""}` }];
 
-    const parts: any[] = [{ text: `${preface}\n\nTitle: ${payload.title ?? ""}\n\nDetails:\n${payload.text ?? ""}` }];
-
-    // Inline images (URLs and data URLs)
     const images: Array<{ mime: string; base64: string }> = [];
     for (const u of payload.imageUrls ?? []) {
         const inl = await fetchAsInline(u);
@@ -301,56 +215,256 @@ async function opDescribeGarment(payload: {
     return extractJson(resp);
 }
 
-/** ---------- Image render (mannequin + garments → fused preview) ---------- */
+/* ---------------- selectProductImages (3 buckets) ---------------- */
 
-/** Local type for hints (kept in-sync with apps/extension shared type without importing). */
-type Hints = {
-    bullets?: string[];
-    fit?: string;
-    silhouette?: string;
-    length?: string;
-    waist?: string;
-    rise?: string;
-    sleeve?: string;
-    neckline?: string;
-    drape?: string;
-    fabricWeight?: string;
-    pattern?: string;
-    placementCues?: string[];
-    stylingNotes?: string[];
-    mannequinRecommendation?: string;
+const SELECT_GROUPS_SCHEMA: Json = {
+    type: "object",
+    properties: {
+        groups: {
+            type: "object",
+            properties: {
+                confident: { type: "array", items: { type: "string" } },
+                semiConfident: { type: "array", items: { type: "string" } },
+                notConfident: { type: "array", items: { type: "string" } }
+            },
+            required: ["confident", "semiConfident", "notConfident"]
+        }
+    },
+    required: ["groups"]
 };
 
-function buildHintBullets(h?: Hints | null): string[] {
-    if (!h) return [];
-    const out: string[] = [];
-    if (h.fit) out.push(`fit: ${h.fit}`);
-    if (h.silhouette) out.push(`silhouette: ${h.silhouette}`);
-    if (h.length) out.push(`length: ${h.length}`);
-    if (h.waist) out.push(`waist: ${h.waist}`);
-    if (h.rise) out.push(`rise: ${h.rise}`);
-    if (h.sleeve) out.push(`sleeve: ${h.sleeve}`);
-    if (h.neckline) out.push(`neckline: ${h.neckline}`);
-    if (h.drape) out.push(`drape: ${h.drape}`);
-    if (h.fabricWeight) out.push(`fabricWeight: ${h.fabricWeight}`);
-    if (h.pattern) out.push(`pattern: ${h.pattern}`);
-    for (const p of h.placementCues ?? []) out.push(`placement: ${p}`);
-    for (const s of h.stylingNotes ?? []) out.push(`style: ${s}`);
-    for (const b of h.bullets ?? []) out.push(b);
-    return out;
+async function opSelectProductImages(payload: {
+    anchors?: string[];
+    candidates: Array<{ url: string; score?: number; origin?: string }>;
+    pageTitle?: string;
+    pageText?: string;
+    maxInline?: number;
+}) {
+    const anchors = Array.isArray(payload.anchors) ? payload.anchors.slice(0, 3) : [];
+    const maxInline = Math.max(6, Math.min(payload.maxInline ?? 12, 12));
+
+    // 1) Extract features for anchors (dHash & color baseline).
+    const anchorFeatures: { dhash: string; avg: { r: number; g: number; b: number } }[] = [];
+    for (const u of anchors) {
+        try {
+            const res = await fetch(u);
+            if (!res.ok) continue;
+            const buf = Buffer.from(await res.arrayBuffer());
+            const f = await featuresFromBuffer(buf);
+            anchorFeatures.push({ dhash: f.dhashHex, avg: f.avg });
+        } catch { /* ignore */ }
+    }
+    const anchorHashes = anchorFeatures.map((a) => a.dhash);
+    const avgAnchorColor = anchorFeatures.length
+        ? anchorFeatures.reduce(
+            (acc, a) => ({ r: acc.r + a.avg.r, g: acc.g + a.avg.g, b: acc.b + a.avg.b }),
+            { r: 0, g: 0, b: 0 }
+        )
+        : { r: 128, g: 128, b: 128 };
+    if (anchorFeatures.length) {
+        avgAnchorColor.r = Math.round(avgAnchorColor.r / anchorFeatures.length);
+        avgAnchorColor.g = Math.round(avgAnchorColor.g / anchorFeatures.length);
+        avgAnchorColor.b = Math.round(avgAnchorColor.b / anchorFeatures.length);
+    }
+
+    // 2) Compute features for all candidates
+    const enriched = await Promise.all(
+        payload.candidates.map(async (c) => {
+            let dhash: string | undefined;
+            let dist: number | undefined;
+            let colorSim = 0;
+            try {
+                const res = await fetch(c.url);
+                if (res.ok) {
+                    const buf = Buffer.from(await res.arrayBuffer());
+                    const f = await featuresFromBuffer(buf);
+                    dhash = f.dhashHex;
+                    dist = minDistanceToAnchors(f.dhashHex, anchorHashes);
+                    const cd = colorDistance(f.avg, avgAnchorColor); // 0..441
+                    colorSim = 1 - Math.min(cd, 441.67) / 441.67; // 0..1 (higher is better)
+                }
+            } catch { /* ignore */ }
+
+            // URL heuristics
+            const url = c.url;
+            const isEditorial = /(?:-e(?:\.|\/|-)|editorial|lookbook|campaign|lifestyle|kids|baby)/i.test(url) ? 1 : 0;
+            const looksLikePackshot = /(\/p\/|_p\.|\/product|packshot|studio)/i.test(url) ? 1 : 0;
+
+            // Aspect ratio hint (often ~1:1 or 4:5 for packshots)
+            let arHint = 0.5; // unknown baseline
+            try {
+                const u = new URL(url);
+                const w = Number(new URLSearchParams(u.search).get("w") || "0");
+                if (w) {
+                    // prefer larger w
+                    arHint = w >= 800 ? 1 : w >= 560 ? 0.8 : 0.6;
+                }
+            } catch { /* ignore */ }
+
+            // Composite score (0..1)
+            const distScore = typeof dist === "number" ? 1 - Math.min(dist, 32) / 32 : 0.25;
+            const urlBias = looksLikePackshot ? 0.15 : 0;
+            const editorialPenalty = isEditorial ? -0.25 : 0;
+            const composite = Math.max(0, Math.min(1, 0.55 * distScore + 0.25 * colorSim + 0.15 * arHint + urlBias + editorialPenalty));
+
+            return {
+                ...c,
+                dhash,
+                dist,
+                colorSim: Number.isFinite(colorSim) ? Number(colorSim.toFixed(3)) : 0,
+                isEditorial,
+                looksLikePackshot,
+                composite: Number(composite.toFixed(3))
+            };
+        })
+    );
+
+    // 3) Initial rule-based bucketing (everything ends up in a bucket)
+    const groups = {
+        confident: [] as string[],
+        semiConfident: [] as string[],
+        notConfident: [] as string[]
+    };
+
+    const borderline: { id: string; url: string; composite: number; dist?: number }[] = [];
+
+    enriched.forEach((e, i) => {
+        const id = `C${i + 1}`;
+        const d = e.dist ?? 64;
+        const s = e.composite ?? 0;
+        if (d <= 8 && s >= 0.7 && e.isEditorial === 0) groups.confident.push(e.url);
+        else if (d <= 16 && s >= 0.5) { groups.semiConfident.push(e.url); borderline.push({ id, url: e.url, composite: s, dist: e.dist }); }
+        else groups.notConfident.push(e.url);
+    });
+
+    // 4) Give LLM a chance to re-assign top ambiguous (inline subset)
+    const inlineParts: any[] = [];
+    let inlineImageCount = 0;
+
+    for (const u of anchors) {
+        const inl = await fetchAsInline(u);
+        if (!inl) continue;
+        inlineParts.push({ text: `ANCHOR` }, { inline_data: { mime_type: inl.mime, data: inl.base64 } });
+        inlineImageCount++;
+    }
+
+    // Inline at most maxInline ambiguous + a few high/low examples from each bucket
+    const toInline: { id: string; url: string }[] = [];
+    const ambis = borderline.slice(0, Math.max(3, maxInline - 6));
+    toInline.push(...ambis.map((b) => ({ id: b.id, url: b.url })));
+
+    const takeFew = (arr: string[], n: number) => arr.slice(0, n).map((url, idx) => ({ id: `S${idx + 1}`, url }));
+    toInline.push(...takeFew(groups.confident, 2), ...takeFew(groups.notConfident, 2));
+
+    const uniqueInline = Array.from(new Map(toInline.map((x) => [x.url, x])).values()).slice(0, maxInline);
+    for (const c of uniqueInline) {
+        const inl = await fetchAsInline(c.url);
+        if (!inl) continue;
+        inlineParts.push({ text: `CANDIDATE ${c.id} ${c.url}` }, { inline_data: { mime_type: inl.mime, data: inl.base64 } });
+        inlineImageCount++;
+    }
+
+    const header = SELECT_PRODUCT_IMAGES_HEADER({ pageTitle: payload.pageTitle, contextText: payload.pageText });
+
+    const list = [
+        `All candidates (${enriched.length}):`,
+        ...enriched.map((e, i) =>
+            `C${i + 1}: ${e.url}\n  score=${e.score ?? 0} dist=${e.dist ?? "NA"} colorSim=${e.colorSim ?? 0} composite=${e.composite ?? 0} editorial=${e.isEditorial} packshot=${e.looksLikePackshot}`
+        )
+    ].join("\n");
+
+    const parts: any[] = [{ text: header }, ...inlineParts, { text: list }];
+
+    let llmGroups = { confident: [] as string[], semiConfident: [] as string[], notConfident: [] as string[] };
+    try {
+        const resp = await generateContent(TEXT_MODEL, {
+            contents: [{ role: "user", parts }],
+            generationConfig: { responseMimeType: "application/json", responseSchema: SELECT_GROUPS_SCHEMA }
+        });
+        const obj = extractJson(resp);
+        const g = obj["groups"] as Record<string, unknown> | undefined;
+        if (g) {
+            const arr = (v: unknown) => (Array.isArray(v) ? (v as unknown[]).map(String) : []);
+            llmGroups = {
+                confident: arr(g["confident"]),
+                semiConfident: arr(g["semiConfident"]),
+                notConfident: arr(g["notConfident"])
+            };
+        }
+    } catch (e) {
+        // If LLM step fails, keep rule-based groups; log for debugging.
+        logger.warn("selectProductImages: LLM reassignment failed", e as Error);
+    }
+
+    // 5) Merge LLM decision conservatively: LLM may promote/demote; ensure partition & include ALL images.
+    const allUrls = new Set(enriched.map((e) => e.url));
+    const final = {
+        confident: new Set<string>(groups.confident),
+        semiConfident: new Set<string>(groups.semiConfident),
+        notConfident: new Set<string>(groups.notConfident)
+    };
+
+    // Apply promotions/demotions from LLM groups
+    const apply = (target: "confident" | "semiConfident" | "notConfident", urls: string[]) => {
+        for (const u of urls) if (allUrls.has(u)) {
+            final.confident.delete(u);
+            final.semiConfident.delete(u);
+            final.notConfident.delete(u);
+            final[target].add(u);
+        }
+    };
+    apply("confident", llmGroups.confident);
+    apply("semiConfident", llmGroups.semiConfident);
+    apply("notConfident", llmGroups.notConfident);
+
+    // Ensure every url is placed
+    for (const u of allUrls) {
+        if (!final.confident.has(u) && !final.semiConfident.has(u) && !final.notConfident.has(u)) {
+            final.semiConfident.add(u); // fallback neutral bucket
+        }
+    }
+
+    // Stable deterministic ordering: by composite desc, then by dist asc
+    const scoreMap = new Map(enriched.map((e) => [e.url, e.composite ?? 0]));
+    const distMap = new Map(enriched.map((e) => [e.url, e.dist ?? 64]));
+    const order = (a: string, b: string) => {
+        const sc = (scoreMap.get(b)! - scoreMap.get(a)!);
+        if (sc !== 0) return sc;
+        return (distMap.get(a)! - distMap.get(b)!);
+    };
+
+    const outGroups = {
+        confident: Array.from(final.confident).sort(order),
+        semiConfident: Array.from(final.semiConfident).sort(order),
+        notConfident: Array.from(final.notConfident).sort(order)
+    };
+
+    return {
+        groups: outGroups,
+        debug: {
+            anchorsCount: anchors.length,
+            inlineImageCount,
+            totals: {
+                confident: outGroups.confident.length,
+                semiConfident: outGroups.semiConfident.length,
+                notConfident: outGroups.notConfident.length
+            }
+        }
+    };
 }
+
+/* ---------------- renderLook (multi-image per item) ---------------- */
 
 async function opRenderLook(payload: {
     mannequinUrl?: string;
     mannequinDataUrl?: string;
-    items: Array<{ title: string; role: string; imageUrl?: string; hintBullets?: string[]; hints?: Hints }>;
+    items: Array<{ title: string; role: string; imageUrl?: string; imageUrls?: string[]; hintBullets?: string[] }>;
     style?: string;
     background?: string;
 }) {
-    /** 1) Collect images: mannequin first, then each garment */
     const images: Array<{ mime: string; base64: string }> = [];
 
-    // Mannequin (URL or data URL)
+    // Mannequin
     if (payload.mannequinDataUrl?.startsWith("data:")) {
         const parsed = parseDataUrl(payload.mannequinDataUrl);
         if (parsed) images.push(parsed);
@@ -359,84 +473,37 @@ async function opRenderLook(payload: {
         if (man) images.push(man);
     }
 
-    // Garment images
-    const itemsResolved = [];
-    for (const it of payload.items.slice(0, 4)) {
-        let imgInline: { mime: string; base64: string } | undefined;
-        if (it.imageUrl) imgInline = await fetchAsInline(it.imageUrl);
-        if (imgInline) images.push(imgInline);
-
-        // Ensure we have usable hints: prefer provided, otherwise auto‑describe from image.
-        let hints: Hints | undefined = it.hints;
-        if ((!hints || buildHintBullets(hints).length === 0) && it.imageUrl) {
-            try {
-                const desc = await opDescribeGarment({ title: it.title, imageUrls: [it.imageUrl] });
-                const coerce = (k: string) => (typeof (desc as any)[k] === "string" ? String((desc as any)[k]) : undefined);
-                const coerceArr = (k: string) => (Array.isArray((desc as any)[k]) ? (desc as any)[k].map(String) : undefined);
-                hints = {
-                    bullets: coerceArr("bullets"),
-                    fit: coerce("fit"),
-                    silhouette: coerce("silhouette"),
-                    length: coerce("length"),
-                    waist: coerce("waist"),
-                    rise: coerce("rise"),
-                    sleeve: coerce("sleeve"),
-                    neckline: coerce("neckline"),
-                    drape: coerce("drape"),
-                    fabricWeight: coerce("fabricWeight"),
-                    pattern: coerce("pattern"),
-                    placementCues: coerceArr("placementCues"),
-                    stylingNotes: coerceArr("stylingNotes"),
-                    mannequinRecommendation: coerce("mannequinRecommendation")
-                };
-            } catch (err) {
-                logger.warn("describeGarment during render failed; continuing without hints", err as Error);
-            }
+    // Garments: include all provided imageUrls (cap at 4 per item)
+    for (const it of payload.items) {
+        const urls: string[] = [];
+        if (it.imageUrls && it.imageUrls.length) urls.push(...it.imageUrls.slice(0, 4));
+        else if (it.imageUrl) urls.push(it.imageUrl);
+        for (const u of urls) {
+            const img = await fetchAsInline(u);
+            if (img) images.push(img);
         }
-
-        itemsResolved.push({ ...it, hints });
     }
 
-    /** 2) Compose guidance text */
-    const garmentList = itemsResolved.map((i) => `${i.role}: ${i.title}`).join("; ");
-
-    const perItemGuidance = itemsResolved
-        .map((i) => {
-            const bullets = [
-                ...(i.hintBullets ?? []),
-                ...buildHintBullets(i.hints)
-            ];
-            const bulletText = bullets.length ? `\n- ${bullets.join("\n- ")}` : "";
-            return `For ${i.role} (“${i.title}”):${bulletText}`;
-        })
+    const garmentList = payload.items.map((i) => `${i.role}: ${i.title}`).join("; ");
+    const hintText = payload.items
+        .map((i) => (i.hintBullets && i.hintBullets.length ? `HINTS for ${i.role}:\n- ${i.hintBullets.join("\n- ")}` : ""))
+        .filter(Boolean)
         .join("\n\n");
 
-    const bg = payload.background || "soft neutral studio backdrop (#f7f7f7), subtle drop shadow";
-    const style =
-        payload.style ||
-        "realistic garment draping on a neutral mannequin, true-to-color, minimal reflections, high detail, product photography, PNG output";
-
     const prompt = [
-        // System-style guardrails for Nano Banana compositing
-        "Use the FIRST inline image as the base mannequin.",
-        "Blend the subsequent garment images onto the mannequin to form a single outfit preview.",
-        "Keep the mannequin static and centered; do not change the body pose. Respect gravity and seam alignment. Preserve the original garment colors/patterns.",
-        "Scale and position garments to match realistic proportions. Align shoulder seams, waist/rise, and hems per guidance. Avoid adding extra accessories.",
+        "Blend the provided garment images onto a blank mannequin to form a single outfit preview.",
+        "Keep the mannequin static; align garment edges and natural folds; maintain realistic proportions.",
         `Outfit items: ${garmentList}.`,
-        "Per-item guidance:",
-        perItemGuidance,
-        `Style: ${style}. Background: ${bg}.`,
-        "Output a single front-facing product preview image in PNG format."
-    ]
-        .filter(Boolean)
-        .join("\n");
+        hintText ? `Guidance:\n${hintText}` : "",
+        RENDER_STYLE_LINE,
+        RENDER_BG_LINE,
+        "Output a single front-facing product preview image."
+    ].filter(Boolean).join("\n");
 
-    /** 3) Generate the image */
     try {
-        const dataUrl = await generateOutfitImageNanoBanana(prompt, images);
+        const dataUrl = await generateImageFromParts(prompt, images);
         return { dataUrl };
-    } catch (e) {
-        // Graceful placeholder SVG to avoid UI breakage
+    } catch {
         const svg = [
             `<svg xmlns="http://www.w3.org/2000/svg" width="720" height="900" viewBox="0 0 720 900">`,
             `<rect width="100%" height="100%" fill="#f7f7f7"/>`,
@@ -448,63 +515,34 @@ async function opRenderLook(payload: {
     }
 }
 
-/** ---------- HTTP entrypoint ---------- */
+/* ---------------- HTTP entrypoint ---------------- */
 
 export const aiLogic = onRequest(
     { region: REGION, cors: true, timeoutSeconds: 120, memory: "1GiB" },
     async (req, res): Promise<void> => {
         res.setHeader("Access-Control-Allow-Origin", "*");
         res.setHeader("Access-Control-Allow-Headers", "content-type");
-        if (req.method === "OPTIONS") {
-            res.status(204).send("");
-            return;
-        }
-        if (req.method !== "POST") {
-            bad(res, 405, "POST only");
-            return;
-        }
+        if (req.method === "OPTIONS") { res.status(204).send(""); return; }
+        if (req.method !== "POST") { bad(res, 405, "POST only"); return; }
 
-        let op = "";
-        let payload: any = undefined;
-        try {
-            op = String(req.body?.op || "");
-            payload = req.body?.payload ?? {};
-        } catch {
-            bad(res, 400, "Invalid JSON body");
-            return;
-        }
+        let op = ""; let payload: any = undefined;
+        try { op = String(req.body?.op || ""); payload = req.body?.payload ?? {}; }
+        catch { bad(res, 400, "Invalid JSON body"); return; }
 
         try {
             switch (op) {
-                case "summarize":
-                    ok(res, await opSummarize(payload));
-                    return;
-                case "detectLanguage":
-                    ok(res, await opDetectLanguage(payload));
-                    return;
-                case "translate":
-                    ok(res, await opTranslate(payload));
-                    return;
-                case "classify":
-                    ok(res, await opClassify(payload));
-                    return;
+                case "summarize": ok(res, await opSummarize(payload)); return;
+                case "detectLanguage": ok(res, await opDetectLanguage(payload)); return;
+                case "translate": ok(res, await opTranslate(payload)); return;
+                case "classify": ok(res, await opClassify(payload)); return;
                 case "composeLooks": {
-                    if (!payload?.schema) {
-                        bad(res, 400, "Missing schema");
-                        return;
-                    }
-                    ok(res, await opComposeLooks(payload));
-                    return;
+                    if (!payload?.schema) { bad(res, 400, "Missing schema"); return; }
+                    ok(res, await opComposeLooks(payload)); return;
                 }
-                case "describeGarment":
-                    ok(res, await opDescribeGarment(payload));
-                    return;
-                case "renderLook":
-                    ok(res, await opRenderLook(payload));
-                    return;
-                default:
-                    bad(res, 400, `Unknown op: ${op}`);
-                    return;
+                case "describeGarment": ok(res, await opDescribeGarment(payload)); return;
+                case "selectProductImages": ok(res, await opSelectProductImages(payload)); return;
+                case "renderLook": ok(res, await opRenderLook(payload)); return;
+                default: bad(res, 400, `Unknown op: ${op}`); return;
             }
         } catch (e) {
             logger.error(e);

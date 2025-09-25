@@ -1,6 +1,5 @@
 /**
- * Cloud AI Logic client — text ops, looks, garment description, and image renders.
- * Update: renderLook now accepts rich per-item `hints` (RenderHints) in addition to legacy `hintBullets`.
+ * Cloud AI Logic client — text ops, looks, garment description, image selection, and image renders.
  */
 import { aiLogicUrl, isAiLogicConfigured } from "../config/env";
 import type { Outfit, WardrobeItem, RenderHints } from "@outfnd/shared/types";
@@ -11,10 +10,7 @@ async function post<T>(op: string, payload: unknown): Promise<T> {
     if (!isAiLogicConfigured || !aiLogicUrl) throw new Error("AI Logic endpoint not configured");
     const res = await fetch(aiLogicUrl, {
         method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            "X-Client": "Outfnd/extension"
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ op, payload })
     });
     if (!res.ok) throw new Error(`AI Logic ${op} failed: ${res.status} ${await res.text()}`);
@@ -31,16 +27,12 @@ export async function cloudDetectLanguage(text: string): Promise<string> {
     const out = await post<{ language?: unknown }>("detectLanguage", { text });
     return typeof out.language === "string" ? out.language : "und";
 }
-export async function cloudTranslate(
-    text: string,
-    from: string | undefined,
-    to: string
-): Promise<string> {
+export async function cloudTranslate(text: string, from: string | undefined, to: string): Promise<string> {
     const out = await post<{ translated?: unknown }>("translate", { text, from, to });
     return typeof out.translated === "string" ? out.translated : text;
 }
 
-/* ------- Classify attributes (returns ClassifiedAttributes) ------- */
+/* ------- Classify attributes ------- */
 export async function cloudClassifyAttributes(
     imageDataUrl: string | undefined,
     textContext: string
@@ -76,7 +68,7 @@ export async function cloudClassifyAttributes(
     return out;
 }
 
-/* ------- Compose looks (cloud JSON mode) ------- */
+/* ------- Compose looks ------- */
 export async function cloudComposeLooks(
     wardrobe: WardrobeItem[],
     createdFromItemId?: string
@@ -145,8 +137,35 @@ export async function cloudDescribeGarment(input: DescribeGarmentInput): Promise
         pattern: s("pattern"),
         placementCues: a("placementCues"),
         stylingNotes: a("stylingNotes"),
-        mannequinRecommendation: s("mannequinRecommendation") as RenderHints["mannequinRecommendation"]
+        mannequinRecommendation: s("mannequinRecommendation")
     };
+}
+
+/* ------- Image selection (3 buckets) ------- */
+export interface SelectGroups {
+    confident: string[];
+    semiConfident: string[];
+    notConfident: string[];
+}
+export interface SelectProductImagesOutput {
+    groups: SelectGroups;
+    debug?: unknown;
+}
+
+export async function cloudSelectProductImages(
+    anchors: string[],
+    candidates: string[],
+    pageTitle?: string,
+    pageText?: string
+): Promise<SelectProductImagesOutput> {
+    const payload = {
+        anchors,
+        candidates: candidates.map((url) => ({ url })),
+        pageTitle,
+        pageText,
+        maxInline: 12
+    };
+    return await post<SelectProductImagesOutput>("selectProductImages", payload);
 }
 
 /* ------- Render look ------- */
@@ -154,10 +173,8 @@ export interface RenderItemInput {
     title: string;
     role: string;
     imageUrl?: string;
-    /** Legacy support: brief bullets */
+    imageUrls?: string[]; // NEW: multiple per item
     hintBullets?: string[];
-    /** Preferred rich hints */
-    hints?: RenderHints;
 }
 export interface RenderLookInput {
     mannequinUrl?: string;

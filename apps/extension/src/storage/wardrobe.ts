@@ -1,6 +1,6 @@
 /**
  * Local wardrobe storage (Chrome storage with localStorage fallback).
- * Fix: added no-op statements inside catch blocks to satisfy no-empty.
+ * Persists optional selectedImages (used for mannequin renders).
  */
 import type { WardrobeItem, WardrobeAttributes, RenderHints } from "@outfnd/shared/types";
 
@@ -14,7 +14,6 @@ async function getStore(): Promise<WardrobeItem[]> {
             return Array.isArray(arr) ? arr : [];
         }
     } catch {
-        // noop (fallback to localStorage)
         void 0;
     }
     const raw = localStorage.getItem(KEY);
@@ -28,7 +27,6 @@ async function setStore(items: WardrobeItem[]): Promise<void> {
             return;
         }
     } catch {
-        // noop (fallback to localStorage)
         void 0;
     }
     localStorage.setItem(KEY, JSON.stringify(items));
@@ -48,7 +46,8 @@ export async function addItemFromAnalysis(
     product: { title: string; url: string; images?: string[] },
     attributes: WardrobeAttributes,
     language?: string,
-    renderHints?: RenderHints
+    renderHints?: RenderHints,
+    selectedImages?: string[]
 ): Promise<WardrobeItem> {
     const items = await getStore();
     const now = Date.now();
@@ -58,6 +57,7 @@ export async function addItemFromAnalysis(
         title: product.title,
         sourceUrl: product.url,
         images: product.images ?? [],
+        selectedImages: selectedImages ?? [],
         attributes: { ...attributes, language },
         renderHints,
         createdAt: now,

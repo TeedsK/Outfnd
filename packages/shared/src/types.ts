@@ -44,6 +44,8 @@ export interface WardrobeItem {
     title: string;
     sourceUrl: string;
     images: string[];
+    /** User-selected images most representative of this garment. */
+    selectedImages?: string[];
     attributes: WardrobeAttributes;
     /** Optional garment description & placement hints derived from image+text. */
     renderHints?: RenderHints;

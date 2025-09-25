@@ -1,8 +1,7 @@
 /**
  * Outfnd — Side Panel App (white/off-white palette)
- * Now shows a spinner while Gemini renders, retries failed tiles, emits
- * structured debug logs, and sends richer garment hints to the cloud
- * so Nano Banana can place clothes on the mannequin more reliably.
+ * Adds: image-selection loading state; spinners/skeletons in ImagePicker; disables
+ * clipping/analyze/save while selection is processing.
  */
 import React from "react";
 import { requestClip } from "./api/bridge";
@@ -16,12 +15,14 @@ import { loadSettings } from "../settings/store";
 import {
     cloudDescribeGarment,
     cloudRenderLookPreview,
+    cloudSelectProductImages,
     type RenderLookInput
 } from "../cloud/aiLogic";
 import { isAiLogicConfigured } from "../config/env";
 import { composeLooks, type ComposeResult } from "../ai/composer";
 import { loadMannequin, type MannequinKind } from "../assets/mannequinLoader";
 import { aiLogicUrl } from "../config/env";
+import { ImagePicker, type Buckets } from "./components/ImagePicker";
 
 type ClipState =
     | { status: "idle" }
@@ -53,6 +54,13 @@ type LookPreview =
     | { status: "done"; url: string }
     | { status: "error"; error: string };
 
+/** Image-selection pipeline status (LLM + heuristics). */
+type ImgSelState =
+    | { status: "idle" }
+    | { status: "loading" }
+    | { status: "done" }
+    | { status: "error"; error: string };
+
 export function App() {
     const [clip, setClip] = React.useState<ClipState>({ status: "idle" });
     const [analyze, setAnalyze] = React.useState<AnalyzeState>({ status: "idle" });
@@ -62,8 +70,13 @@ export function App() {
     const [wardrobeCount, setWardrobeCount] = React.useState<number>(0);
     const [showSettings, setShowSettings] = React.useState(false);
 
-    // Mannequin selector (default 'female')
+    // Mannequin selector
     const [mannequin, setMannequin] = React.useState<MannequinKind>("female");
+
+    // Image selection buckets + chosen set for the currently clipped product
+    const [imgBuckets, setImgBuckets] = React.useState<Buckets>({ confident: [], semiConfident: [], notConfident: [] });
+    const [chosen, setChosen] = React.useState<Set<string>>(new Set());
+    const [imgSel, setImgSel] = React.useState<ImgSelState>({ status: "idle" });
 
     // Per-look preview map
     const [previewMap, setPreviewMap] = React.useState<Record<string, LookPreview>>({});
@@ -80,11 +93,65 @@ export function App() {
         setPreviewMap({});
         setPreviewNote("");
         setGarmentHints(null);
+        setImgBuckets({ confident: [], semiConfident: [], notConfident: [] });
+        setChosen(new Set());
+        setImgSel({ status: "idle" });
+
         setClip({ status: "loading" });
         const res = await requestClip();
-        if (res.ok && res.product) setClip({ status: "done", product: res.product });
-        else setClip({ status: "error", error: res.error || "Unknown error" });
+        if (res.ok && res.product) {
+            setClip({ status: "done", product: res.product });
+
+            // Start selection (show loading UI in picker)
+            setImgSel({ status: "loading" });
+            const anchors = res.product.images.slice(0, 2);
+            const candidates = Array.from(new Set(res.product.images));
+            if (isAiLogicConfigured) {
+                try {
+                    const sel = await cloudSelectProductImages(
+                        anchors,
+                        candidates,
+                        res.product.title,
+                        [res.product.description, res.product.returnsText].filter(Boolean).join("\n\n")
+                    );
+                    console.debug("[Outfnd] selectProductImages:debug", sel.debug);
+                    setImgBuckets(sel.groups);
+                    setChosen(new Set(sel.groups.confident)); // default to confident
+                    setImgSel({ status: "done" });
+                } catch (e) {
+                    console.debug("[Outfnd] selectProductImages failed", e);
+                    // Fallback to simple default, but show an error message
+                    const conf = candidates.slice(0, 3);
+                    setImgBuckets({ confident: conf, semiConfident: candidates.slice(3, 6), notConfident: candidates.slice(6) });
+                    setChosen(new Set(conf));
+                    setImgSel({ status: "error", error: "Smart grouping failed; using simple fallback." });
+                }
+            } else {
+                // No cloud — still present a deterministic layout
+                const conf = candidates.slice(0, 3);
+                setImgBuckets({ confident: conf, semiConfident: candidates.slice(3, 6), notConfident: candidates.slice(6) });
+                setChosen(new Set(conf));
+                setImgSel({ status: "done" });
+            }
+        } else {
+            setClip({ status: "error", error: res.error || "Unknown error" });
+            setImgSel({ status: "idle" });
+        }
     };
+
+    const onToggleImage = (url: string) => {
+        setChosen((prev) => {
+            const next = new Set(prev);
+            if (next.has(url)) next.delete(url);
+            else next.add(url);
+            return next;
+        });
+    };
+    const onSelectFirst = (n: number) => {
+        const ordered = [...imgBuckets.confident, ...imgBuckets.semiConfident, ...imgBuckets.notConfident].slice(0, n);
+        setChosen(new Set(ordered));
+    };
+    const onClear = () => setChosen(new Set());
 
     const onAnalyze = async () => {
         if (clip.status !== "done") return;
@@ -94,17 +161,15 @@ export function App() {
             const result = await analyzeProduct(clip.product);
             setAnalyze({ status: "done", result });
 
-            // Cloud garment description → richer mannequin guidance
             if (isAiLogicConfigured) {
                 try {
                     const text = [clip.product.description, clip.product.returnsText]
                         .filter(Boolean)
                         .join("\n\n");
-                    const img = clip.product.images?.[0];
                     const hints = await cloudDescribeGarment({
                         title: clip.product.title,
                         text,
-                        imageUrls: img ? [img] : []
+                        imageUrls: Array.from(chosen)
                     });
                     setGarmentHints(hints);
                     const rec = hints.mannequinRecommendation;
@@ -123,11 +188,13 @@ export function App() {
         if (clip.status !== "done" || analyze.status !== "done") return;
         setSave({ status: "saving" });
         try {
+            const selectedImages = Array.from(chosen);
             const item = await addItemFromAnalysis(
                 clip.product,
                 analyze.result.attributes,
                 analyze.result.language,
-                garmentHints ?? undefined
+                garmentHints ?? undefined,
+                selectedImages
             );
             setSave({ status: "done", item });
             const arr = await listWardrobeItems();
@@ -135,11 +202,7 @@ export function App() {
 
             const settings = await loadSettings();
             if (settings.enableFirebaseSync) {
-                try {
-                    await syncWardrobeItemToFirestore(item);
-                } catch {
-                    /* noop */
-                }
+                try { await syncWardrobeItemToFirestore(item); } catch { /* noop */ }
             }
         } catch (e: unknown) {
             const msg = e instanceof Error ? e.message : String(e);
@@ -179,7 +242,7 @@ export function App() {
             return;
         }
 
-        // Mark all looks as loading first (to trigger spinners)
+        // Mark all looks as loading first
         setPreviewMap((m) => {
             const next = { ...m };
             for (const l of looks) next[l.id] = { status: "loading" };
@@ -210,31 +273,27 @@ export function App() {
                 mannequinDataUrl,
                 items: look.items.map((it) => {
                     const item = byId[it.itemId];
+                    const imgs = item?.selectedImages && item.selectedImages.length ? item.selectedImages : item?.images ?? [];
                     return {
                         title: item ? item.title : it.itemId,
                         role: it.role,
-                        imageUrl: item?.images?.[0],
-                        // Provide both the legacy bullets and the richer hints
-                        hintBullets: item?.renderHints?.bullets,
-                        hints: item?.renderHints
+                        imageUrls: imgs.slice(0, 4),
+                        hintBullets: item?.renderHints?.bullets
                     };
                 })
             };
 
-            // Debug (no huge base64)
-            console.debug("[Outfnd] renderLook:request", {
+            console.debug("[Outfnd] renderLook:request\n", JSON.stringify({
                 lookId: look.id,
                 mannequinKind: mannequin,
-                mannequinDataUrlPrefix: mannequinDataUrl.slice(0, 30),
+                mannequinDataUrlPrefix: mannequinDataUrl.slice(0, 10),
                 items: input.items.map((x) => ({
                     role: x.role,
                     title: x.title,
-                    hasImage: Boolean(x.imageUrl),
-                    hintBulletsCount: x.hintBullets?.length ?? 0,
-                    hasRichHints: Boolean(x.hints && Object.values(x.hints).some(Boolean))
+                    imageCount: x.imageUrls?.length ?? (x.imageUrl ? 1 : 0),
                 })),
                 aiLogicUrl
-            });
+            }, null, 2));
 
             const dataUrl = await cloudRenderLookPreview(input);
 
@@ -250,7 +309,7 @@ export function App() {
 
             setPreviewMap((m) => ({ ...m, [look.id]: { status: "done", url: dataUrl } }));
         } catch (err) {
-            console.debug("[Outfnd] renderLook:error", { lookId: look.id, error: String(err) });
+            console.debug("[Outfnd] renderLook:error\n", JSON.stringify({ lookId: look.id, error: String(err) }, null, 2));
             setPreviewMap((m) => ({ ...m, [look.id]: { status: "error", error: String(err) } }));
         }
     }
@@ -287,6 +346,8 @@ export function App() {
 
     const canSave = analyze.status === "done" && save.status !== "done";
     const canCompose = save.status === "done" || wardrobeCount > 0;
+
+    const selectedCount = chosen.size;
 
     return (
         <div className="panel">
@@ -336,10 +397,11 @@ export function App() {
                 <button
                     className="btn"
                     onClick={onClip}
-                    disabled={clip.status === "loading"}
-                    aria-busy={clip.status === "loading"}
+                    disabled={clip.status === "loading" || imgSel.status === "loading"}
+                    aria-busy={clip.status === "loading" || imgSel.status === "loading"}
+                    title={imgSel.status === "loading" ? "Grouping images…" : undefined}
                 >
-                    {clip.status === "loading" ? "Clipping…" : "Clip current page"}
+                    {clip.status === "loading" ? "Clipping…" : imgSel.status === "loading" ? "Sorting images…" : "Clip current page"}
                 </button>
 
                 {clip.status === "error" && (
@@ -380,6 +442,18 @@ export function App() {
                             </figure>
                         )}
 
+                        {/* Image Picker (three buckets) */}
+                        <ImagePicker
+                            buckets={imgBuckets}
+                            selected={chosen}
+                            onToggle={onToggleImage}
+                            onSelectFirst={onSelectFirst}
+                            onClear={onClear}
+                            loading={imgSel.status === "loading"}
+                            error={imgSel.status === "error" ? imgSel.error : undefined}
+                        />
+                        <div className="small" style={{ marginTop: 4 }}>{selectedCount} selected</div>
+
                         {clip.product.description && (
                             <>
                                 <h3>Description</h3>
@@ -398,8 +472,9 @@ export function App() {
                             <button
                                 className="btn secondary"
                                 onClick={onAnalyze}
-                                disabled={analyze.status === "loading"}
+                                disabled={analyze.status === "loading" || imgSel.status === "loading"}
                                 aria-busy={analyze.status === "loading"}
+                                title={imgSel.status === "loading" ? "Please wait for image grouping to finish" : undefined}
                             >
                                 {analyze.status === "loading" ? "Analyzing…" : "Analyze on-device"}
                             </button>
@@ -407,12 +482,16 @@ export function App() {
                             <button
                                 className="btn secondary"
                                 onClick={onSave}
-                                disabled={!canSave || save.status === "saving"}
+                                disabled={imgSel.status === "loading" || !selectedCount || analyze.status !== "done" || save.status === "saving"}
                                 aria-busy={save.status === "saving"}
                                 title={
-                                    analyze.status !== "done"
-                                        ? "Analyze first to get attributes"
-                                        : "Save this item to your wardrobe"
+                                    imgSel.status === "loading"
+                                        ? "Please wait for image grouping to finish"
+                                        : analyze.status !== "done"
+                                            ? "Analyze first to get attributes"
+                                            : selectedCount === 0
+                                                ? "Select at least one image"
+                                                : "Save this item to your wardrobe"
                                 }
                             >
                                 {save.status === "saving" ? "Saving…" : save.status === "done" ? "Saved ✓" : "Save to wardrobe"}
@@ -500,7 +579,7 @@ export function App() {
 
                 {clip.status === "idle" && (
                     <p className="lede">
-                        Clip, Analyze, Save, Compose — with **male/female mannequin** previews powered by Gemini.
+                        Clip, Analyze, Save, Compose — now with **per‑bucket loading** for smarter image selection.
                     </p>
                 )}
             </section>
@@ -548,9 +627,11 @@ function LooksList({
                                     {l.items.map((it, idx) => {
                                         const item = items[it.itemId];
                                         const name = item ? item.title : it.itemId;
+                                        const thumb = item?.selectedImages && item.selectedImages[0] ? item.selectedImages[0] : item?.images?.[0];
                                         return (
-                                            <li key={`${l.id}_${idx}`}>
+                                            <li key={`${l.id}_${idx}`} style={{ display: "flex", alignItems: "center", gap: 6 }}>
                                                 <strong>{it.role}</strong> — {name}
+                                                {thumb && <img src={thumb} alt="" style={{ width: 28, height: 28, objectFit: "cover", borderRadius: 4, border: "1px solid var(--border)" }} />}
                                             </li>
                                         );
                                     })}

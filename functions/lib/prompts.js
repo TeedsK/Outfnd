@@ -2,35 +2,29 @@
  * Outfnd — Prompt Library
  * Centralized, tweakable prompts for all Gemini ops.
  */
-
 export const SUMMARIZE_INSTR = `
 Summarize the following product information into 3–5 concise bullet points
 focused strictly on: fit, care, and returns policy.
 Return bullet lines only (no headings).
 `.trim();
-
 export const DETECT_LANGUAGE_INSTR = `
 Detect the language and return ONLY a BCP‑47 code (e.g., en, es, fr).
 `.trim();
-
-export const TRANSLATE_INSTR = (from: string | undefined, to: string) => `
+export const TRANSLATE_INSTR = (from, to) => `
 Translate from ${from || "auto"} to ${to}. Return only the translation text.
 `.trim();
-
 export const CLASSIFY_INSTR = `
 You are a fashion product attribute classifier.
 Return ONLY JSON that conforms to the provided schema.
 Prefer common fashion terms, e.g., "navy", "ecru", "pinstripe".
 Infer reasonable attributes if not explicitly stated.
 `.trim();
-
-export const COMPOSE_LOOKS_INSTR = (seed?: string) => `
+export const COMPOSE_LOOKS_INSTR = (seed) => `
 Compose three outfits for the following occasions: casual, office, evening.
 Use ONLY the provided wardrobe item ids.
 ${seed ? `Include the seed item id "${seed}" in each look.` : ""}
 Return ONLY JSON that conforms to the schema. Avoid commentary outside JSON.
 `.trim();
-
 export const DESCRIBE_GARMENT_PREFACE = `
 You are a fashion vision-language expert. Analyze the garment in the provided image(s)
 and the optional text. Return ONLY JSON per the schema, being specific and concise.
@@ -38,7 +32,6 @@ Include body-position cues (e.g., "hem hits at knees", "cropped above ankle"),
 fit (slim/relaxed/oversized), silhouette, rise/waist. Provide stylingNotes that help place
 and align this garment on a blank mannequin realistically.
 `.trim();
-
 /**
  * Selection instruction for keeping only angles/close‑ups of the SAME product.
  * Caller attaches:
@@ -50,13 +43,9 @@ and align this garment on a blank mannequin realistically.
  *
  * Upgrade: strongly incorporate product text, then verify visually against anchors.
  */
-export const SELECT_PRODUCT_IMAGES_HEADER = (args: {
-    pageTitle?: string;
-    contextText?: string;
-}) => {
+export const SELECT_PRODUCT_IMAGES_HEADER = (args) => {
     const ctx = (args.contextText ?? "").slice(0, 1600);
-
-    const lines: string[] = [
+    const lines = [
         `Task: Assign EVERY candidate image to one of three buckets with respect to the SAME focal product shown in the ANCHOR images.`,
         ``,
         `Buckets (you will still return keys "confident", "semiConfident", "notConfident"):`,
@@ -103,13 +92,11 @@ export const SELECT_PRODUCT_IMAGES_HEADER = (args: {
     ];
     return lines.join("\n");
 };
-
 /** Style line added to render prompts (tweakable). */
 export const RENDER_STYLE_LINE = `
 Style: realistic garment draping on a blank mannequin, true-to-color,
 minimal reflections, high detail, studio product photography (4k).
 `.trim();
-
 export const RENDER_BG_LINE = `
 Background: soft neutral studio (#f7f7f7) with subtle drop shadow.
 `.trim();

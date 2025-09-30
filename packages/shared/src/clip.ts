@@ -8,6 +8,8 @@ export interface ExtractedProduct {
     title: string;
     description?: string;
     images: string[];
+    /** Explicit anchors for similarity: usually og:image + hero packshot. */
+    anchors?: string[];
     retailer?: string;
     url: string;
     price?: number | null;

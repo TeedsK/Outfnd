@@ -1,20 +1,42 @@
 /**
  * Cloud AI Logic client — text ops, looks, garment description, image selection, and image renders.
+ * Adds: health ping + richer request/response logs + x-outfnd-client header.
  */
 import { aiLogicUrl, isAiLogicConfigured } from "../config/env";
 import type { Outfit, WardrobeItem, RenderHints } from "@outfnd/shared/types";
 import type { ClassifiedAttributes } from "../ai/stubs";
 import { ATTRIBUTE_SCHEMA, LOOKS_SCHEMA, GARMENT_HINTS_SCHEMA } from "../ai/jsonSchemas";
 
+function clientTag(): string {
+    try {
+        // Chrome extension id is stable across the session; helps correlate logs
+        const id = typeof chrome !== "undefined" && chrome.runtime?.id ? chrome.runtime.id : "noid";
+        return `ext/${id}`;
+    } catch {
+        return "ext/unknown";
+    }
+}
+
 async function post<T>(op: string, payload: unknown): Promise<T> {
     if (!isAiLogicConfigured || !aiLogicUrl) throw new Error("AI Logic endpoint not configured");
     const res = await fetch(aiLogicUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+            "Content-Type": "application/json",
+            "x-outfnd-client": clientTag()
+        },
         body: JSON.stringify({ op, payload })
     });
     if (!res.ok) throw new Error(`AI Logic ${op} failed: ${res.status} ${await res.text()}`);
     return (await res.json()) as T;
+}
+
+/* ------- Health ------- */
+export async function cloudHealth(): Promise<Record<string, unknown>> {
+    const out = await post<Record<string, unknown>>("health", {});
+    // One concise log line
+    console.debug("[Outfnd] aiLogic health", out);
+    return out;
 }
 
 /* ------- Optional text ops ------- */
@@ -149,6 +171,7 @@ export interface SelectGroups {
 }
 export interface SelectProductImagesOutput {
     groups: SelectGroups;
+    selected?: string[];
     debug?: unknown;
 }
 
@@ -165,7 +188,29 @@ export async function cloudSelectProductImages(
         pageText,
         maxInline: 12
     };
-    return await post<SelectProductImagesOutput>("selectProductImages", payload);
+
+    console.debug("[Outfnd] selectProductImages:request", {
+        aiLogicUrl,
+        anchorsCount: anchors.length,
+        candidateCount: candidates.length,
+        anchorsPreview: anchors.slice(0, 3)
+    });
+
+    const out = await post<SelectProductImagesOutput>("selectProductImages", payload);
+
+    // Friendly totals line for DevTools
+    const g = out.groups;
+    const totals = {
+        confident: Array.isArray(g?.confident) ? g.confident.length : 0,
+        semiConfident: Array.isArray(g?.semiConfident) ? g.semiConfident.length : 0,
+        notConfident: Array.isArray(g?.notConfident) ? g.notConfident.length : 0,
+        all: (Array.isArray(g?.confident) ? g.confident.length : 0)
+            + (Array.isArray(g?.semiConfident) ? g.semiConfident.length : 0)
+            + (Array.isArray(g?.notConfident) ? g.notConfident.length : 0)
+    };
+    console.debug("[Outfnd] selectProductImages:response", totals);
+
+    return out;
 }
 
 /* ------- Render look ------- */
@@ -173,7 +218,7 @@ export interface RenderItemInput {
     title: string;
     role: string;
     imageUrl?: string;
-    imageUrls?: string[]; // NEW: multiple per item
+    imageUrls?: string[];
     hintBullets?: string[];
 }
 export interface RenderLookInput {

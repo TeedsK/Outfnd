@@ -2,6 +2,8 @@
  * Outfnd — Side Panel App (white/off-white palette)
  * Adds: image-selection loading state; spinners/skeletons in ImagePicker; disables
  * clipping/analyze/save while selection is processing.
+ *
+ * Update: ping health on mount; richer request/response logs for selectProductImages.
  */
 import React from "react";
 import { requestClip } from "./api/bridge";
@@ -16,7 +18,8 @@ import {
     cloudDescribeGarment,
     cloudRenderLookPreview,
     cloudSelectProductImages,
-    type RenderLookInput
+    type RenderLookInput,
+    cloudHealth
 } from "../cloud/aiLogic";
 import { isAiLogicConfigured } from "../config/env";
 import { composeLooks, type ComposeResult } from "../ai/composer";
@@ -86,6 +89,13 @@ export function App() {
         listWardrobeItems().then((arr) => setWardrobeCount(arr.length));
     }, []);
 
+    // Ping health once at mount if configured
+    React.useEffect(() => {
+        if (isAiLogicConfigured) {
+            void cloudHealth().catch((e) => console.debug("[Outfnd] aiLogic health failed", e));
+        }
+    }, []);
+
     const onClip = async () => {
         setAnalyze({ status: "idle" });
         setSave({ status: "idle" });
@@ -106,21 +116,38 @@ export function App() {
             setImgSel({ status: "loading" });
             const anchors = res.product.images.slice(0, 2);
             const candidates = Array.from(new Set(res.product.images));
+
             if (isAiLogicConfigured) {
                 try {
+                    console.debug("[Outfnd] selectProductImages:request", {
+                        aiLogicUrl,
+                        anchorsCount: anchors.length,
+                        candidateCount: candidates.length,
+                        anchorsPreview: anchors
+                    });
+
                     const sel = await cloudSelectProductImages(
                         anchors,
                         candidates,
                         res.product.title,
                         [res.product.description, res.product.returnsText].filter(Boolean).join("\n\n")
                     );
-                    console.debug("[Outfnd] selectProductImages:debug", sel.debug);
-                    setImgBuckets(sel.groups);
-                    setChosen(new Set(sel.groups.confident)); // default to confident
+
+                    const g = sel.groups;
+                    const totals = {
+                        confident: g.confident.length,
+                        semiConfident: g.semiConfident.length,
+                        notConfident: g.notConfident.length,
+                        all: g.confident.length + g.semiConfident.length + g.notConfident.length
+                    };
+                    console.debug("[Outfnd] selectProductImages:debug", { ...sel.debug, ...totals });
+
+                    setImgBuckets(g);
+                    setChosen(new Set(g.confident)); // default to confident
                     setImgSel({ status: "done" });
                 } catch (e) {
-                    console.debug("[Outfnd] selectProductImages failed", e);
-                    // Fallback to simple default, but show an error message
+                    console.debug("[Outfnd] selectProductImages:error", e);
+                    // Fallback deterministic layout
                     const conf = candidates.slice(0, 3);
                     setImgBuckets({ confident: conf, semiConfident: candidates.slice(3, 6), notConfident: candidates.slice(6) });
                     setChosen(new Set(conf));

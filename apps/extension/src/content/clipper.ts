@@ -1,11 +1,12 @@
 /**
  * Outfnd — Clipper orchestrator
  * Purpose: Run JSON-LD and DOM extractors, then merge into one result.
- * Update:
- *  - Collect all DOM + JSON-LD image candidates.
- *  - Score them and call Cloud op selectProductImages (LLM vision) to retain only
- *    images of the same clothing item as the anchors (OG image + hero).
- *  - Fall back to heuristic ranking if cloud is unavailable.
+ *
+ * Update (critical):
+ *  - DO NOT call the cloud image selector here. We return ALL deduped candidates.
+ *  - Also return explicit anchors (og:image + best hero IMG) so the side panel can
+ *    drive bucketing with the full set of images.
+ *  - Add structured console.debug logs to trace what was discovered.
  */
 import type { ClipResponse, ExtractedProduct } from "@outfnd/shared/clip";
 import { extractFromJsonLd, collectJsonLdImageCandidates } from "./jsonld";
@@ -16,10 +17,6 @@ import {
     normalizeForDedupe,
     finalizeImageCandidates
 } from "./imageFilter";
-import { isAiLogicConfigured } from "../config/env";
-import { cloudSelectProductImages } from "../cloud/aiLogic";
-
-/* ---------- helpers ---------- */
 
 function merge(a: ExtractedProduct | null, b: ExtractedProduct | null): ExtractedProduct | null {
     if (!a && !b) return null;
@@ -39,7 +36,9 @@ function merge(a: ExtractedProduct | null, b: ExtractedProduct | null): Extracte
         currency: json.currency ?? dom.currency ?? null,
         returnsText: json.returnsText || dom.returnsText,
         jsonLd: json.jsonLd ?? undefined,
-        source: "mixed"
+        source: "mixed",
+        // anchors filled later by this orchestrator
+        anchors: undefined
     };
 }
 
@@ -117,32 +116,9 @@ export async function clipCurrentDocument(): Promise<ClipResponse> {
         const hero = pickHeroImg(document, domCands);
         if (hero) anchors.push(hero);
 
-        // 4) Score & (optionally) call cloud selector
-        const scored = dedupeAndScore(allCands).slice(0, 40); // cap to keep payload tame
-        const { title: pageTitle, text: pageText } = collectPageContext(document);
-
-        let selected: string[] = [];
-
-        if (isAiLogicConfigured && scored.length) {
-            try {
-                selected = await cloudSelectProductImages({
-                    anchors,
-                    candidates: scored,
-                    pageTitle,
-                    pageText,
-                    maxReturn: 24
-                });
-            } catch (err) {
-                // cloud path failed, we'll fall back below
-                // eslint-disable-next-line no-console
-                console.debug("[Outfnd] selectProductImages cloud failed", err);
-            }
-        }
-
-        // 5) Fallback: heuristic top-N if cloud gave nothing
-        if (!Array.isArray(selected) || selected.length === 0) {
-            selected = finalizeImageCandidates(allCands, 12);
-        }
+        // 4) De-dup + rank (NO cloud filtering here; we want a superset back in the panel)
+        const scored = dedupeAndScore(allCands); // keep order by score
+        const selected = scored.map((s) => s.url).slice(0, 40); // cap payload size
 
         // Ensure absolute URLs
         const finalImages = selected
@@ -153,8 +129,20 @@ export async function clipCurrentDocument(): Promise<ClipResponse> {
 
         const product: ExtractedProduct = {
             ...merged,
-            images: finalImages.length ? finalImages : merged.images
+            images: finalImages.length ? finalImages : merged.images,
+            anchors: Array.from(new Set(anchors))
         };
+
+        const { title: pageTitle } = collectPageContext(document);
+        console.debug("[Outfnd] clipper collected", {
+            pageTitle,
+            domCandidates: domCands.length,
+            jsonLdCandidates: jsonCands.length,
+            allCandidates: allCands.length,
+            dedupedRanked: scored.length,
+            finalImages: product.images.length,
+            anchors: product.anchors
+        });
 
         return { ok: true, product };
     } catch (e: unknown) {

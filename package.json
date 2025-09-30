@@ -10,7 +10,8 @@
     "build:ext": "npm run build -w apps/extension",
     "build:web": "npm run build -w apps/web-viewer",
     "typecheck": "tsc -b",
-    "format": "prettier -w ."
+    "format": "prettier -w .",
+    "deploy:functions": "npm run build -w functions && firebase deploy --only functions:aiLogic"
   },
   "keywords": [],
   "author": "",
@@ -26,6 +27,5 @@
     "prettier": "^3.6.2",
     "typescript": "^5.9.2"
   },
-  "dependencies": {
-  }
+  "dependencies": {}
 }

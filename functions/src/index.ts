@@ -1,18 +1,20 @@
 /**
  * Firebase Function: aiLogic (single endpoint router)
  * Ops:
- *  - summarize        -> { bullets }
- *  - detectLanguage   -> { language }
- *  - translate        -> { translated }
- *  - classify         -> schema-constrained JSON
- *  - composeLooks     -> { looks }
- *  - describeGarment  -> garment hints JSON
- *  - selectProductImages -> { groups: {confident, semiConfident, notConfident}, debug }
- *  - renderLook       -> { dataUrl }
+ *  - health           -> { ok, ... }
+ *  - summarize        -> { bullets, debug }
+ *  - detectLanguage   -> { language, debug }
+ *  - translate        -> { translated, debug }
+ *  - classify         -> schema‑constrained JSON (+ __modelUsed)
+ *  - composeLooks     -> { looks, debug }
+ *  - describeGarment  -> garment hints JSON (+ __modelUsed)
+ *  - selectProductImages -> { groups, selected, debug }
+ *  - renderLook       -> { dataUrl, debug }
  */
 import * as logger from "firebase-functions/logger";
 import { onRequest } from "firebase-functions/v2/https";
 import { initializeApp } from "firebase-admin/app";
+
 import {
     SUMMARIZE_INSTR,
     DETECT_LANGUAGE_INSTR,
@@ -23,8 +25,8 @@ import {
     SELECT_PRODUCT_IMAGES_HEADER,
     RENDER_STYLE_LINE,
     RENDER_BG_LINE
-} from "./prompts";
-import { featuresFromBuffer, minDistanceToAnchors, colorDistance } from "./vision";
+} from "./prompts.js";
+import { featuresFromBuffer, minDistanceToAnchors, colorDistance } from "./vision.js";
 
 initializeApp();
 
@@ -32,8 +34,9 @@ type Json = Record<string, unknown>;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const REGION = "us-central1";
-const TEXT_MODEL = process.env.TEXT_MODEL || "gemini-1.5-flash";
-const IMAGE_MODEL = process.env.IMAGE_MODEL || "gemini-2.5-flash-image-preview";
+const TEXT_MODEL = (process.env.TEXT_MODEL || "gemini-1.5-flash").trim();
+const IMAGE_MODEL = (process.env.IMAGE_MODEL || "gemini-2.5-flash-image-preview").trim();
+const API_VERSION_ORDER = ["v1beta", "v1"] as const;
 
 /* ---------------- Utilities ---------------- */
 
@@ -61,14 +64,64 @@ async function postJson(url: string, body: unknown): Promise<any> {
         headers: { "x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json" },
         body: JSON.stringify(body)
     });
-    if (!res.ok) { const text = await res.text(); throw new Error(`Gemini API ${res.status}: ${text}`); }
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Gemini API ${res.status}: ${text}`);
+    }
     return await res.json();
 }
 
-async function generateContent(model: string, request: Json): Promise<any> {
+function normalizeModelNameForGL(input: string, kind: "text" | "image"): string {
+    let name = (input || "").trim();
+    if (!name) return kind === "image" ? "gemini-2.5-flash-image-preview" : "gemini-1.5-flash";
+    name = name.replace(/^models\//i, "");
+    name = name.replace(/^projects\/[^/]+\/locations\/[^/]+\/publishers\/google\/models\//i, "");
+    const m = name.match(/^(gemini-[\w.-]*?)-(?:\d+|00[1-9])$/i);
+    if (m) name = `${m[1]}-latest`;
+    return name;
+}
+function isNotFoundModelError(err: unknown): boolean {
+    const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+    return /not[_\- ]found/.test(msg) || /\b404\b/.test(msg);
+}
+function apiUrlForModel(model: string, apiVersion: typeof API_VERSION_ORDER[number]): string {
+    return `https://generativelanguage.googleapis.com/${apiVersion}/models/${encodeURIComponent(model)}:generateContent`;
+}
+
+async function generateContentWithFallback(
+    requestedModel: string,
+    request: Json,
+    kind: "text" | "image"
+): Promise<{ resp: any; modelUsed: string; apiVersionUsed: string; modelRequested: string }> {
     ensureKey();
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-    return await postJson(url, request);
+
+    const normalized = normalizeModelNameForGL(requestedModel, kind);
+    const tryModels: string[] = [normalized];
+    if (!/latest$/i.test(normalized)) tryModels.push(`${normalized}-latest`.replace(/-latest-latest$/i, "-latest"));
+
+    if (kind === "text") {
+        for (const m of ["gemini-1.5-flash-latest", "gemini-1.5-flash"]) if (!tryModels.includes(m)) tryModels.push(m);
+    } else {
+        for (const m of ["gemini-2.5-flash-image-preview", "gemini-1.5-flash"]) if (!tryModels.includes(m)) tryModels.push(m);
+    }
+
+    let lastErr: unknown = undefined;
+    for (const apiVersion of API_VERSION_ORDER) {
+        for (const model of tryModels) {
+            try {
+                const url = apiUrlForModel(model, apiVersion);
+                logger.info(`[aiLogic] generateContent -> model=${model} api=${apiVersion}`);
+                const resp = await postJson(url, request);
+                return { resp, modelUsed: model, apiVersionUsed: apiVersion, modelRequested: requestedModel };
+            } catch (e) {
+                lastErr = e;
+                const nf = isNotFoundModelError(e);
+                logger.warn(`[aiLogic] model failed model=${model} api=${apiVersion} reason=${nf ? "NOT_FOUND" : "error"} msg=${String(e).slice(0, 240)}`);
+                if (!nf) break;
+            }
+        }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
 async function fetchAsInline(url: string): Promise<{ mime: string; base64: string } | undefined> {
@@ -91,44 +144,53 @@ function parseDataUrl(dataUrl: string): { mime: string; base64: string } | undef
 async function generateImageFromParts(
     prompt: string,
     images: Array<{ mime: string; base64: string }>
-): Promise<string> {
-    ensureKey();
+): Promise<{ dataUrl: string; modelUsed: string; apiVersionUsed: string }> {
     const parts: any[] = [{ text: prompt }, ...images.map((i) => ({ inline_data: { mime_type: i.mime, data: i.base64 } }))];
     const req = { contents: [{ role: "user", parts }] };
-    const resp = await generateContent(IMAGE_MODEL, req as Json);
+    const { resp, modelUsed, apiVersionUsed } = await generateContentWithFallback(IMAGE_MODEL, req as Json, "image");
     const candidate = resp?.candidates?.[0];
     const outParts = candidate?.content?.parts ?? [];
     const img = outParts.find((p: any) => p?.inline_data?.data)?.inline_data;
-    if (img?.data) return `data:${img.mime_type || "image/png"};base64,${img.data}`;
+    if (img?.data) return { dataUrl: `data:${img.mime_type || "image/png"};base64,${img.data}`, modelUsed, apiVersionUsed };
     throw new Error("Image generation unavailable (no inline image in response)");
 }
 
 /* ---------------- Ops (text) ---------------- */
 
 async function opSummarize(payload: { text: string }) {
-    const resp = await generateContent(TEXT_MODEL, {
-        contents: [{ role: "user", parts: [{ text: `${SUMMARIZE_INSTR}\n\n${payload.text}` }] }]
-    });
+    const { resp, modelUsed, apiVersionUsed } = await generateContentWithFallback(
+        TEXT_MODEL,
+        { contents: [{ role: "user", parts: [{ text: `${SUMMARIZE_INSTR}\n\n${payload.text}` }] }] } as Json,
+        "text"
+    );
     const text = extractText(resp);
     const bullets = text.split("\n").map((l) => l.trim().replace(/^[-*•]\s*/, "")).filter(Boolean).slice(0, 5);
-    return { bullets };
+    return { bullets, debug: { modelUsed, apiVersionUsed } };
 }
 
 async function opDetectLanguage(payload: { text: string }) {
-    const resp = await generateContent(TEXT_MODEL, {
-        contents: [{ role: "user", parts: [{ text: `${DETECT_LANGUAGE_INSTR}\n\n${payload.text}` }] }],
-        generationConfig: { responseMimeType: "text/plain" }
-    });
+    const { resp, modelUsed, apiVersionUsed } = await generateContentWithFallback(
+        TEXT_MODEL,
+        {
+            contents: [{ role: "user", parts: [{ text: `${DETECT_LANGUAGE_INSTR}\n\n${payload.text}` }] }],
+            generationConfig: { responseMimeType: "text/plain" }
+        } as Json,
+        "text"
+    );
     const code = extractText(resp).trim().split(/\s+/)[0] || "und";
-    return { language: code };
+    return { language: code, debug: { modelUsed, apiVersionUsed } };
 }
 
 async function opTranslate(payload: { text: string; from?: string; to: string }) {
-    const resp = await generateContent(TEXT_MODEL, {
-        contents: [{ role: "user", parts: [{ text: `${TRANSLATE_INSTR(payload.from, payload.to)}\n\n${payload.text}` }] }],
-        generationConfig: { responseMimeType: "text/plain" }
-    });
-    return { translated: extractText(resp) };
+    const { resp, modelUsed, apiVersionUsed } = await generateContentWithFallback(
+        TEXT_MODEL,
+        {
+            contents: [{ role: "user", parts: [{ text: `${TRANSLATE_INSTR(payload.from, payload.to)}\n\n${payload.text}` }] }],
+            generationConfig: { responseMimeType: "text/plain" }
+        } as Json,
+        "text"
+    );
+    return { translated: extractText(resp), debug: { modelUsed, apiVersionUsed } };
 }
 
 /* ---------------- Ops (JSON mode) ---------------- */
@@ -139,11 +201,18 @@ async function opClassify(payload: { text: string; imageDataUrl?: string; schema
         const parsed = parseDataUrl(payload.imageDataUrl);
         if (parsed) parts.push({ inline_data: { mime_type: parsed.mime, data: parsed.base64 } });
     }
-    const resp = await generateContent(TEXT_MODEL, {
-        contents: [{ role: "user", parts }],
-        generationConfig: { responseMimeType: "application/json", responseSchema: payload.schema }
-    });
-    return extractJson(resp);
+    const { resp, modelUsed, apiVersionUsed } = await generateContentWithFallback(
+        TEXT_MODEL,
+        {
+            contents: [{ role: "user", parts }],
+            generationConfig: { responseMimeType: "application/json", responseSchema: payload.schema }
+        } as Json,
+        "text"
+    );
+    const json = extractJson(resp);
+    (json as any).__modelUsed = modelUsed;
+    (json as any).__apiVersionUsed = apiVersionUsed;
+    return json;
 }
 
 async function opComposeLooks(payload: {
@@ -152,12 +221,16 @@ async function opComposeLooks(payload: {
     schema: Json;
 }) {
     const instr = COMPOSE_LOOKS_INSTR(payload.createdFromItemId);
-    const resp = await generateContent(TEXT_MODEL, {
-        contents: [{ role: "user", parts: [{ text: `${instr}\n\nWardrobe:\n${JSON.stringify(payload.wardrobe, null, 2)}` }] }],
-        generationConfig: { responseMimeType: "application/json", responseSchema: payload.schema }
-    });
+    const { resp, modelUsed, apiVersionUsed } = await generateContentWithFallback(
+        TEXT_MODEL,
+        {
+            contents: [{ role: "user", parts: [{ text: `${instr}\n\nWardrobe:\n${JSON.stringify(payload.wardrobe, null, 2)}` }] }],
+            generationConfig: { responseMimeType: "application/json", responseSchema: payload.schema }
+        } as Json,
+        "text"
+    );
     const obj = extractJson(resp);
-    return { looks: Array.isArray(obj["looks"]) ? (obj["looks"] as unknown[]) : [] };
+    return { looks: Array.isArray(obj["looks"]) ? (obj["looks"] as unknown[]) : [], debug: { modelUsed, apiVersionUsed } };
 }
 
 /* ---------------- describeGarment ---------------- */
@@ -207,12 +280,19 @@ async function opDescribeGarment(payload: {
         parts.push({ inline_data: { mime_type: img.mime, data: img.base64 } });
     }
 
-    const resp = await generateContent(TEXT_MODEL, {
-        contents: [{ role: "user", parts }],
-        generationConfig: { responseMimeType: "application/json", responseSchema: schema }
-    });
+    const { resp, modelUsed, apiVersionUsed } = await generateContentWithFallback(
+        TEXT_MODEL,
+        {
+            contents: [{ role: "user", parts }],
+            generationConfig: { responseMimeType: "application/json", responseSchema: schema }
+        } as Json,
+        "text"
+    );
 
-    return extractJson(resp);
+    const json = extractJson(resp);
+    (json as any).__modelUsed = modelUsed;
+    (json as any).__apiVersionUsed = apiVersionUsed;
+    return json;
 }
 
 /* ---------------- selectProductImages (3 buckets) ---------------- */
@@ -243,7 +323,13 @@ async function opSelectProductImages(payload: {
     const anchors = Array.isArray(payload.anchors) ? payload.anchors.slice(0, 3) : [];
     const maxInline = Math.max(6, Math.min(payload.maxInline ?? 12, 12));
 
-    // 1) Extract features for anchors (dHash & color baseline).
+    logger.info(`[aiLogic] selectProductImages request`, {
+        anchorsCount: anchors.length,
+        candidateCount: payload.candidates.length,
+        pageTitle: payload.pageTitle ?? ""
+    });
+
+    // 1) Anchor features
     const anchorFeatures: { dhash: string; avg: { r: number; g: number; b: number } }[] = [];
     for (const u of anchors) {
         try {
@@ -252,7 +338,9 @@ async function opSelectProductImages(payload: {
             const buf = Buffer.from(await res.arrayBuffer());
             const f = await featuresFromBuffer(buf);
             anchorFeatures.push({ dhash: f.dhashHex, avg: f.avg });
-        } catch { /* ignore */ }
+        } catch (e) {
+            logger.warn(`[aiLogic] anchor fetch failed: ${u} :: ${String(e)}`);
+        }
     }
     const anchorHashes = anchorFeatures.map((a) => a.dhash);
     const avgAnchorColor = anchorFeatures.length
@@ -267,7 +355,7 @@ async function opSelectProductImages(payload: {
         avgAnchorColor.b = Math.round(avgAnchorColor.b / anchorFeatures.length);
     }
 
-    // 2) Compute features for all candidates
+    // 2) Candidate features
     const enriched = await Promise.all(
         payload.candidates.map(async (c) => {
             let dhash: string | undefined;
@@ -280,32 +368,31 @@ async function opSelectProductImages(payload: {
                     const f = await featuresFromBuffer(buf);
                     dhash = f.dhashHex;
                     dist = minDistanceToAnchors(f.dhashHex, anchorHashes);
-                    const cd = colorDistance(f.avg, avgAnchorColor); // 0..441
-                    colorSim = 1 - Math.min(cd, 441.67) / 441.67; // 0..1 (higher is better)
+                    const cd = colorDistance(f.avg, avgAnchorColor); // 0..441.7
+                    colorSim = 1 - Math.min(cd, 441.67) / 441.67; // 0..1
                 }
-            } catch { /* ignore */ }
+            } catch (e) {
+                logger.warn(`[aiLogic] candidate fetch failed: ${c.url} :: ${String(e)}`);
+            }
 
-            // URL heuristics
+            // Heuristics from URL
             const url = c.url;
             const isEditorial = /(?:-e(?:\.|\/|-)|editorial|lookbook|campaign|lifestyle|kids|baby)/i.test(url) ? 1 : 0;
             const looksLikePackshot = /(\/p\/|_p\.|\/product|packshot|studio)/i.test(url) ? 1 : 0;
 
-            // Aspect ratio hint (often ~1:1 or 4:5 for packshots)
-            let arHint = 0.5; // unknown baseline
+            // Aspect hint
+            let arHint = 0.5;
             try {
                 const u = new URL(url);
                 const w = Number(new URLSearchParams(u.search).get("w") || "0");
-                if (w) {
-                    // prefer larger w
-                    arHint = w >= 800 ? 1 : w >= 560 ? 0.8 : 0.6;
-                }
+                if (w) arHint = w >= 800 ? 1 : w >= 560 ? 0.8 : 0.6;
             } catch { /* ignore */ }
 
-            // Composite score (0..1)
+            // Composite: emphasize color a bit more
             const distScore = typeof dist === "number" ? 1 - Math.min(dist, 32) / 32 : 0.25;
             const urlBias = looksLikePackshot ? 0.15 : 0;
             const editorialPenalty = isEditorial ? -0.25 : 0;
-            const composite = Math.max(0, Math.min(1, 0.55 * distScore + 0.25 * colorSim + 0.15 * arHint + urlBias + editorialPenalty));
+            const composite = Math.max(0, Math.min(1, 0.45 * distScore + 0.35 * colorSim + 0.15 * arHint + urlBias + editorialPenalty));
 
             return {
                 ...c,
@@ -319,25 +406,30 @@ async function opSelectProductImages(payload: {
         })
     );
 
-    // 3) Initial rule-based bucketing (everything ends up in a bucket)
-    const groups = {
-        confident: [] as string[],
-        semiConfident: [] as string[],
-        notConfident: [] as string[]
-    };
-
+    // 3) Rule-based pre-buckets (relaxed)
+    const groups = { confident: [] as string[], semiConfident: [] as string[], notConfident: [] as string[] };
     const borderline: { id: string; url: string; composite: number; dist?: number }[] = [];
 
     enriched.forEach((e, i) => {
         const id = `C${i + 1}`;
         const d = e.dist ?? 64;
         const s = e.composite ?? 0;
-        if (d <= 8 && s >= 0.7 && e.isEditorial === 0) groups.confident.push(e.url);
-        else if (d <= 16 && s >= 0.5) { groups.semiConfident.push(e.url); borderline.push({ id, url: e.url, composite: s, dist: e.dist }); }
-        else groups.notConfident.push(e.url);
+        const highColor = (e.colorSim ?? 0) >= 0.86;
+        const nearDist = d <= 12;
+        const medDist = d <= 20;
+        const farButLikely = d <= 28 && highColor && e.looksLikePackshot && e.isEditorial === 0;
+
+        if (e.isEditorial === 0 && e.looksLikePackshot && ((nearDist && s >= 0.60) || (medDist && highColor && s >= 0.55))) {
+            groups.confident.push(e.url);
+        } else if (e.isEditorial === 0 && ((d <= 28 && s >= 0.45) || farButLikely)) {
+            groups.semiConfident.push(e.url);
+            borderline.push({ id, url: e.url, composite: s, dist: e.dist });
+        } else {
+            groups.notConfident.push(e.url);
+        }
     });
 
-    // 4) Give LLM a chance to re-assign top ambiguous (inline subset)
+    // 4) LLM reassignment
     const inlineParts: any[] = [];
     let inlineImageCount = 0;
 
@@ -348,13 +440,15 @@ async function opSelectProductImages(payload: {
         inlineImageCount++;
     }
 
-    // Inline at most maxInline ambiguous + a few high/low examples from each bucket
     const toInline: { id: string; url: string }[] = [];
-    const ambis = borderline.slice(0, Math.max(3, maxInline - 6));
-    toInline.push(...ambis.map((b) => ({ id: b.id, url: b.url })));
-
-    const takeFew = (arr: string[], n: number) => arr.slice(0, n).map((url, idx) => ({ id: `S${idx + 1}`, url }));
-    toInline.push(...takeFew(groups.confident, 2), ...takeFew(groups.notConfident, 2));
+    if (enriched.length <= maxInline) {
+        enriched.forEach((e, i) => toInline.push({ id: `C${i + 1}`, url: e.url }));
+    } else {
+        const ambis = borderline.slice(0, Math.max(4, maxInline - 6));
+        toInline.push(...ambis.map((b) => ({ id: b.id, url: b.url })));
+        const takeFew = (arr: string[], n: number) => arr.slice(0, n).map((url, idx) => ({ id: `S${idx + 1}`, url }));
+        toInline.push(...takeFew(groups.confident, 3), ...takeFew(groups.notConfident, 3));
+    }
 
     const uniqueInline = Array.from(new Map(toInline.map((x) => [x.url, x])).values()).slice(0, maxInline);
     for (const c of uniqueInline) {
@@ -365,7 +459,6 @@ async function opSelectProductImages(payload: {
     }
 
     const header = SELECT_PRODUCT_IMAGES_HEADER({ pageTitle: payload.pageTitle, contextText: payload.pageText });
-
     const list = [
         `All candidates (${enriched.length}):`,
         ...enriched.map((e, i) =>
@@ -376,11 +469,16 @@ async function opSelectProductImages(payload: {
     const parts: any[] = [{ text: header }, ...inlineParts, { text: list }];
 
     let llmGroups = { confident: [] as string[], semiConfident: [] as string[], notConfident: [] as string[] };
+    let textModelUsed = "";
+    let textApiVersionUsed = "";
     try {
-        const resp = await generateContent(TEXT_MODEL, {
-            contents: [{ role: "user", parts }],
-            generationConfig: { responseMimeType: "application/json", responseSchema: SELECT_GROUPS_SCHEMA }
-        });
+        const { resp, modelUsed, apiVersionUsed } = await generateContentWithFallback(
+            TEXT_MODEL,
+            { contents: [{ role: "user", parts }], generationConfig: { responseMimeType: "application/json", responseSchema: SELECT_GROUPS_SCHEMA } } as Json,
+            "text"
+        );
+        textModelUsed = modelUsed;
+        textApiVersionUsed = apiVersionUsed;
         const obj = extractJson(resp);
         const g = obj["groups"] as Record<string, unknown> | undefined;
         if (g) {
@@ -392,11 +490,10 @@ async function opSelectProductImages(payload: {
             };
         }
     } catch (e) {
-        // If LLM step fails, keep rule-based groups; log for debugging.
         logger.warn("selectProductImages: LLM reassignment failed", e as Error);
     }
 
-    // 5) Merge LLM decision conservatively: LLM may promote/demote; ensure partition & include ALL images.
+    // 5) Merge & invariants
     const allUrls = new Set(enriched.map((e) => e.url));
     const final = {
         confident: new Set<string>(groups.confident),
@@ -404,7 +501,6 @@ async function opSelectProductImages(payload: {
         notConfident: new Set<string>(groups.notConfident)
     };
 
-    // Apply promotions/demotions from LLM groups
     const apply = (target: "confident" | "semiConfident" | "notConfident", urls: string[]) => {
         for (const u of urls) if (allUrls.has(u)) {
             final.confident.delete(u);
@@ -417,14 +513,25 @@ async function opSelectProductImages(payload: {
     apply("semiConfident", llmGroups.semiConfident);
     apply("notConfident", llmGroups.notConfident);
 
-    // Ensure every url is placed
-    for (const u of allUrls) {
-        if (!final.confident.has(u) && !final.semiConfident.has(u) && !final.notConfident.has(u)) {
-            final.semiConfident.add(u); // fallback neutral bucket
+    // Hard rule: if an anchor appears in candidates, force it into "confident".
+    const anchorsInCandidates: string[] = [];
+    for (const u of anchors) {
+        if (allUrls.has(u)) {
+            anchorsInCandidates.push(u);
+            final.confident.add(u);
+            final.semiConfident.delete(u);
+            final.notConfident.delete(u);
         }
     }
 
-    // Stable deterministic ordering: by composite desc, then by dist asc
+    // Ensure every url is placed
+    for (const u of allUrls) {
+        if (!final.confident.has(u) && !final.semiConfident.has(u) && !final.notConfident.has(u)) {
+            final.semiConfident.add(u);
+        }
+    }
+
+    // Order helpers
     const scoreMap = new Map(enriched.map((e) => [e.url, e.composite ?? 0]));
     const distMap = new Map(enriched.map((e) => [e.url, e.dist ?? 64]));
     const order = (a: string, b: string) => {
@@ -433,23 +540,52 @@ async function opSelectProductImages(payload: {
         return (distMap.get(a)! - distMap.get(b)!);
     };
 
+    // If confident is empty, auto-promote top items (prefer semiConfident).
+    let autoPromoted: string[] = [];
+    if (final.confident.size === 0) {
+        const semi = Array.from(final.semiConfident).sort(order);
+        const src = semi.length ? semi : Array.from(allUrls).sort(order);
+        autoPromoted = src.slice(0, Math.min(2, src.length));
+        for (const u of autoPromoted) {
+            final.confident.add(u);
+            final.semiConfident.delete(u);
+            final.notConfident.delete(u);
+        }
+    }
+
     const outGroups = {
         confident: Array.from(final.confident).sort(order),
         semiConfident: Array.from(final.semiConfident).sort(order),
         notConfident: Array.from(final.notConfident).sort(order)
     };
 
+    const debug = {
+        anchorsCount: anchors.length,
+        inlineImageCount,
+        totals: {
+            confident: outGroups.confident.length,
+            semiConfident: outGroups.semiConfident.length,
+            notConfident: outGroups.notConfident.length,
+            all: enriched.length
+        },
+        promotions: {
+            anchorsForcedConfident: anchorsInCandidates.length,
+            autoPromoted: autoPromoted.length
+        },
+        models: {
+            textModelRequested: TEXT_MODEL,
+            textModelUsed: textModelUsed,
+            apiVersionUsed: textApiVersionUsed
+        }
+    };
+
+    logger.info(`[aiLogic] selectProductImages result`, debug);
+
+    // Legacy "selected" mirrors "confident" for back-compat.
     return {
         groups: outGroups,
-        debug: {
-            anchorsCount: anchors.length,
-            inlineImageCount,
-            totals: {
-                confident: outGroups.confident.length,
-                semiConfident: outGroups.semiConfident.length,
-                notConfident: outGroups.notConfident.length
-            }
-        }
+        selected: outGroups.confident.slice(),
+        debug
     };
 }
 
@@ -464,7 +600,6 @@ async function opRenderLook(payload: {
 }) {
     const images: Array<{ mime: string; base64: string }> = [];
 
-    // Mannequin
     if (payload.mannequinDataUrl?.startsWith("data:")) {
         const parsed = parseDataUrl(payload.mannequinDataUrl);
         if (parsed) images.push(parsed);
@@ -473,7 +608,6 @@ async function opRenderLook(payload: {
         if (man) images.push(man);
     }
 
-    // Garments: include all provided imageUrls (cap at 4 per item)
     for (const it of payload.items) {
         const urls: string[] = [];
         if (it.imageUrls && it.imageUrls.length) urls.push(...it.imageUrls.slice(0, 4));
@@ -501,8 +635,8 @@ async function opRenderLook(payload: {
     ].filter(Boolean).join("\n");
 
     try {
-        const dataUrl = await generateImageFromParts(prompt, images);
-        return { dataUrl };
+        const { dataUrl, modelUsed, apiVersionUsed } = await generateImageFromParts(prompt, images);
+        return { dataUrl, debug: { imageModelUsed: modelUsed, apiVersionUsed } };
     } catch {
         const svg = [
             `<svg xmlns="http://www.w3.org/2000/svg" width="720" height="900" viewBox="0 0 720 900">`,
@@ -515,13 +649,34 @@ async function opRenderLook(payload: {
     }
 }
 
+/* ---------------- health ---------------- */
+
+async function opHealth() {
+    return {
+        ok: true,
+        textModelConfigured: TEXT_MODEL,
+        textModelNormalized: normalizeModelNameForGL(TEXT_MODEL, "text"),
+        imageModelConfigured: IMAGE_MODEL,
+        imageModelNormalized: normalizeModelNameForGL(IMAGE_MODEL, "image"),
+        apiVersionsTried: API_VERSION_ORDER
+    };
+}
+
 /* ---------------- HTTP entrypoint ---------------- */
+
+logger.info("[aiLogic] boot", {
+    textModelConfigured: TEXT_MODEL,
+    textModelNormalized: normalizeModelNameForGL(TEXT_MODEL, "text"),
+    imageModelConfigured: IMAGE_MODEL,
+    imageModelNormalized: normalizeModelNameForGL(IMAGE_MODEL, "image"),
+    apiVersionsTried: API_VERSION_ORDER
+});
 
 export const aiLogic = onRequest(
     { region: REGION, cors: true, timeoutSeconds: 120, memory: "1GiB" },
     async (req, res): Promise<void> => {
         res.setHeader("Access-Control-Allow-Origin", "*");
-        res.setHeader("Access-Control-Allow-Headers", "content-type");
+        res.setHeader("Access-Control-Allow-Headers", "content-type,x-outfnd-client");
         if (req.method === "OPTIONS") { res.status(204).send(""); return; }
         if (req.method !== "POST") { bad(res, 405, "POST only"); return; }
 
@@ -529,8 +684,12 @@ export const aiLogic = onRequest(
         try { op = String(req.body?.op || ""); payload = req.body?.payload ?? {}; }
         catch { bad(res, 400, "Invalid JSON body"); return; }
 
+        const clientTag = String(req.headers["x-outfnd-client"] || "unknown");
+        logger.info(`[aiLogic] op=${op} client=${clientTag}`);
+
         try {
             switch (op) {
+                case "health": ok(res, await opHealth()); return;
                 case "summarize": ok(res, await opSummarize(payload)); return;
                 case "detectLanguage": ok(res, await opDetectLanguage(payload)); return;
                 case "translate": ok(res, await opTranslate(payload)); return;

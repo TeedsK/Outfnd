@@ -1,6 +1,7 @@
 /**
  * ImagePicker — three buckets UI (confident / semi / not)
  * Now supports loading placeholders per bucket and an optional error hint.
+ * Labels updated to: More images (confident) / Similar clothing (semi‑confident) / Other found images (not‑confident)
  */
 import React from "react";
 
@@ -43,21 +44,21 @@ export function ImagePicker({
             {error && <div className="small" style={{ color: "#b45309", marginBottom: 6 }}>{error}</div>}
 
             <Bucket
-                title={`Confident${loading ? "" : ` (${buckets.confident.length})`}`}
+                title={`More images (confident)${loading ? "" : ` (${buckets.confident.length})`}`}
                 urls={buckets.confident}
                 selected={selected}
                 onToggle={onToggle}
                 loading={loading}
             />
             <Bucket
-                title={`Semi‑confident${loading ? "" : ` (${buckets.semiConfident.length})`}`}
+                title={`Similar clothing (semi‑confident)${loading ? "" : ` (${buckets.semiConfident.length})`}`}
                 urls={buckets.semiConfident}
                 selected={selected}
                 onToggle={onToggle}
                 loading={loading}
             />
             <Bucket
-                title={`Not confident${loading ? "" : ` (${buckets.notConfident.length})`}`}
+                title={`Other found images (not‑confident)${loading ? "" : ` (${buckets.notConfident.length})`}`}
                 urls={buckets.notConfident}
                 selected={selected}
                 onToggle={onToggle}
